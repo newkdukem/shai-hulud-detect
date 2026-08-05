@@ -1050,6 +1050,168 @@ else
 fi
 
 # ============================================================
+#  Testing --history mode (historical forensics)
+# ============================================================
+# A git repo can't live inside test-cases/ (nested .git dirs don't commit), so
+# the fixture is built on the fly: a repo whose WORKING TREE is clean but whose
+# history contains (a) a compromised package.json version, later replaced,
+# (b) an IOC filename (shai-hulud-workflow.yml), later deleted, (c) a
+# shai-hulud branch that was created and deleted (leaves a HEAD reflog trace),
+# (d) a reset-away (reflog-only) commit carrying router_init.js, (e) a
+# campaign IoC string committed then removed, and (f) a blob whose SHA-256 is
+# in MALICIOUS_HASHLIST (reusing the multi-hash-detection fixture content),
+# later deleted.
+echo ""
+echo "========================================"
+echo "  Testing --history mode (historical forensics)"
+echo "========================================"
+
+HIST_TMP=$(mktemp -d)
+HIST_REPO="$HIST_TMP/repo"
+mkdir -p "$HIST_REPO"
+(
+    cd "$HIST_REPO" || exit 1
+    git init -q -b main . 2>/dev/null || { git init -q .; git checkout -qb main; }
+    git config user.email "test@test.local"
+    git config user.name "Test"
+    git config commit.gpgsign false
+    # (a)+(b) infected manifests (one per parser: package.json, yarn.lock,
+    # pnpm-lock.yaml with a SCOPED name, requirements.txt) + IOC workflow file
+    printf '{\n  "name": "victim-app",\n  "version": "1.0.0",\n  "dependencies": {\n    "@ctrl/tinycolor": "4.1.1",\n    "express": "4.18.2"\n  }\n}\n' > package.json
+    printf '"@ctrl/tinycolor@^4.1.0":\n  version "4.1.1"\n\nexpress@^4.18.0:\n  version "4.18.2"\n' > yarn.lock
+    printf "lockfileVersion: '9.0'\npackages:\n  '@ctrl/tinycolor@4.1.2':\n    resolution: {integrity: sha512-x}\n" > pnpm-lock.yaml
+    printf 'requests==2.31.0\nmistralai==2.4.6\n' > requirements.txt
+    mkdir -p .github/workflows
+    printf 'on: push\njobs: {}\n' > .github/workflows/shai-hulud-workflow.yml
+    git add -A && git commit -qm "add deps"
+    # (c) worm branch created + deleted
+    git checkout -qb shai-hulud && git checkout -q main && git branch -qD shai-hulud
+    # (d) reset-away commit carrying an IOC payload name
+    echo "malicious" > router_init.js
+    git add -A && git commit -qm "tmp payload"
+    git reset -q --hard HEAD^
+    # (e) campaign IoC string committed then removed
+    echo 'const d = "IfYouRevokeThisTokenItWillWipeTheComputerOfTheOwner";' > token_desc.js
+    git add -A && git commit -qm "add token desc"
+    git rm -q token_desc.js && git commit -qm "remove token desc"
+    # (f) known-malicious blob content at a payload-shaped path, then deleted
+    cp "$SCRIPT_DIR/test-cases/multi-hash-detection/file1.js" bundle.js
+    git add -A && git commit -qm "vendor bundle"
+    git rm -q bundle.js && git commit -qm "remove bundle"
+    # cleanup commit: working tree ends up with zero live indicators
+    printf '{\n  "name": "victim-app",\n  "version": "1.0.0",\n  "dependencies": {\n    "left-pad": "1.3.0",\n    "express": "4.18.2"\n  }\n}\n' > package.json
+    git rm -q .github/workflows/shai-hulud-workflow.yml yarn.lock pnpm-lock.yaml requirements.txt
+    git add -A && git commit -qm "cleanup"
+) >/dev/null 2>&1
+
+# Without --history the repo must scan clean (nothing lives in the tree).
+HIST_BASE_OUT=$("$BASH_CMD" "$DETECTOR" "$HIST_REPO" 2>&1)
+HIST_BASE_EXIT=$?
+((total++))
+if [[ $HIST_BASE_EXIT -eq 0 ]] && grep -qF "No indicators of Shai-Hulud compromise detected" <<< "$HIST_BASE_OUT"; then
+    echo -e "${GREEN}PASS${NC}: past-infected repo scans CLEAN without --history (tree has no live IOCs)"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: past-infected repo did not scan clean without --history (exit $HIST_BASE_EXIT)"
+    ((failed++))
+fi
+
+# With --history every category of historical evidence must fire, exit 1 (HIGH).
+HIST_OUT=$("$BASH_CMD" "$DETECTOR" --history "$HIST_REPO" 2>&1)
+HIST_EXIT=$?
+((total++))
+if [[ $HIST_EXIT -eq 1 ]]; then
+    echo -e "${GREEN}PASS${NC}: --history flags the past-infected repo as HIGH risk (exit 1)"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: --history exit code $HIST_EXIT (expected 1)"
+    ((failed++))
+fi
+
+for hist_check in \
+    "compromised version in historical package.json|Compromised package in git HISTORY: @ctrl/tinycolor@4.1.1 in package.json" \
+    "compromised version in historical yarn.lock|Compromised package in git HISTORY: @ctrl/tinycolor@4.1.1 in yarn.lock" \
+    "compromised SCOPED version in historical pnpm-lock.yaml|Compromised package in git HISTORY: @ctrl/tinycolor@4.1.2 in pnpm-lock.yaml" \
+    "compromised PyPI pin in historical requirements.txt|Compromised package in git HISTORY: mistralai@2.4.6 in requirements.txt" \
+    "IOC filename once committed (workflow)|Shai-Hulud IOC filename in git HISTORY: .github/workflows/shai-hulud-workflow.yml" \
+    "IOC filename in reset-away commit|Shai-Hulud IOC filename in git HISTORY: router_init.js" \
+    "deleted shai-hulud branch via HEAD reflog|HEAD reflog references a Shai-Hulud branch" \
+    "lost commit carrying IOC file|carries IOC file: router_init.js" \
+    "campaign IoC string in history (pickaxe)|Campaign IoC string in git HISTORY" \
+    "known-malicious blob hash in history|Known-malicious payload in git HISTORY (SHA-256 match): bundle.js" \
+    "rewritten-history informational note|reflog-only"
+do
+    label="${hist_check%|*}"
+    pattern="${hist_check#*|}"
+    ((total++))
+    if grep -qF "$pattern" <<< "$HIST_OUT"; then
+        echo -e "${GREEN}PASS${NC}: --history surfaces: $label"
+        ((passed++))
+    else
+        echo -e "${RED}FAIL${NC}: --history did NOT surface: $label (looked for: '$pattern')"
+        ((failed++))
+    fi
+done
+
+# --history --check-host: package-manager cache forensics against a fake $HOME
+# seeded with a compromised npm _cacache index entry, a yarn berry zip, and a
+# compromised pip wheel. The detector must attribute all three.
+HIST_HOME="$HIST_TMP/home"
+mkdir -p "$HIST_HOME/.npm/_cacache/index-v5/aa/bb" "$HIST_HOME/.cache/pip/wheels/xy" "$HIST_HOME/.yarn/berry/cache"
+echo 'k {"key":"make-fetch-happen:request-cache:https://registry.npmjs.org/@ctrl/tinycolor/-/tinycolor-4.1.1.tgz","integrity":"sha512-x"}' \
+    > "$HIST_HOME/.npm/_cacache/index-v5/aa/bb/entry"
+touch "$HIST_HOME/.cache/pip/wheels/xy/mistralai-2.4.6-py3-none-any.whl"
+touch "$HIST_HOME/.yarn/berry/cache/@ctrl-tinycolor-npm-4.1.1-deadbeef.zip"
+
+HIST_CACHE_OUT=$(HOME="$HIST_HOME" "$BASH_CMD" "$DETECTOR" --history --check-host "$HIST_REPO" 2>&1)
+for cache_check in \
+    "npm _cacache tarball index entry|npm cache holds a compromised package tarball: @ctrl/tinycolor/-/tinycolor-4.1.1.tgz" \
+    "yarn berry cache zip|yarn berry cache holds a compromised package: @ctrl-tinycolor-npm-4.1.1-deadbeef.zip" \
+    "pip wheel cache|pip wheel cache holds a compromised package: mistralai-2.4.6-py3-none-any.whl"
+do
+    label="${cache_check%|*}"
+    pattern="${cache_check#*|}"
+    ((total++))
+    if grep -qF "$pattern" <<< "$HIST_CACHE_OUT"; then
+        echo -e "${GREEN}PASS${NC}: --history --check-host surfaces: $label"
+        ((passed++))
+    else
+        echo -e "${RED}FAIL${NC}: --history --check-host did NOT surface: $label (looked for: '$pattern')"
+        ((failed++))
+    fi
+done
+
+# Without --check-host the cache scan must be skipped (and say so).
+((total++))
+if grep -qF "cache forensics skipped" <<< "$HIST_OUT"; then
+    echo -e "${GREEN}PASS${NC}: --history without --check-host skips cache forensics with a notice"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: --history without --check-host did not print the cache-skip notice"
+    ((failed++))
+fi
+
+# Regression guard for the lockfile block-parser fix that --history surfaced:
+# scoped names in a pnpm pseudo-lock ("@scope/name": {) were skipped by the
+# old "[^\"\\/]+" fallback pattern, and the "packages": { wrapper used to
+# swallow the FIRST package entry. Assert the LIVE lockfile check now flags a
+# scoped pnpm package that is the first (and only) entry.
+HIST_PNPM_DIR="$HIST_TMP/pnpm-live"
+mkdir -p "$HIST_PNPM_DIR"
+printf "lockfileVersion: '9.0'\npackages:\n  '@ctrl/tinycolor@4.1.2':\n    resolution: {integrity: sha512-x}\n" > "$HIST_PNPM_DIR/pnpm-lock.yaml"
+HIST_PNPM_OUT=$("$BASH_CMD" "$DETECTOR" "$HIST_PNPM_DIR" 2>&1)
+((total++))
+if grep -qF "Compromised package in lockfile: @ctrl/tinycolor@4.1.2" <<< "$HIST_PNPM_OUT"; then
+    echo -e "${GREEN}PASS${NC}: live lockfile check flags a scoped pnpm package as first entry (parser fix)"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: live lockfile check missed scoped-first-entry pnpm package @ctrl/tinycolor@4.1.2"
+    ((failed++))
+fi
+
+rm -rf "$HIST_TMP"
+
+# ============================================================
 #  Testing --bulk mode (project discovery + aggregate report)
 # ============================================================
 echo ""

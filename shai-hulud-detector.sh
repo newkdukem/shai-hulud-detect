@@ -29,7 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPROMISED_PACKAGES_FILE="$SCRIPT_DIR/compromised-packages.txt"
 
 # Tool version (surfaced in --json output for downstream consumers)
-SCRIPT_VERSION="3.14.1"
+SCRIPT_VERSION="3.15.0"
 
 # Global temp directory for file-based storage
 TEMP_DIR=""
@@ -158,6 +158,13 @@ create_temp_dir() {
     touch "$TEMP_DIR/malicious_hashes.txt"
     touch "$TEMP_DIR/destructive_patterns.txt"
     touch "$TEMP_DIR/trufflehog_patterns.txt"
+    # Historical forensics (--history) findings
+    touch "$TEMP_DIR/history_compromised.txt"
+    touch "$TEMP_DIR/history_ioc_files.txt"
+    touch "$TEMP_DIR/history_commit_objects.txt"
+    touch "$TEMP_DIR/history_refs.txt"
+    touch "$TEMP_DIR/history_rewrite_stats.txt"
+    touch "$TEMP_DIR/cache_findings.txt"
 }
 
 # Function: cleanup_temp_files
@@ -207,6 +214,16 @@ GREP_TOOL=""
 
 # Semver range checking (opt-in via --check-semver-ranges flag)
 CHECK_SEMVER_RANGES=false
+
+# Historical forensics (opt-in via --history flag): scan git history (all refs
+# plus reflog-only commits) and user-level package caches for evidence that a
+# repo/machine was compromised in the PAST even if the working tree is clean now.
+HISTORY_MODE=false
+# How many commits per repository the --history walks cover (rev-list/log with
+# --all --reflog). 0 = unlimited. The default keeps huge/ancient repos from
+# stalling the scan; the Shai-Hulud campaign window (Sep 2025 onward) sits well
+# inside the most recent 1000 commits for typical projects.
+HISTORY_DEPTH=1000
 
 # Function: select_grep_tool
 # Purpose: Auto-select the best available grep tool (git-grep > ripgrep > grep)
@@ -787,6 +804,21 @@ usage() {
     echo "  --ecosystem LIST   Restrict ecosystem-specific checks to a comma-separated list."
     echo "                     Supported values: npm, pypi, all (default: auto-detect from"
     echo "                     marker files). Content-pattern checks always run regardless."
+    echo ""
+    echo "HISTORICAL FORENSICS (detect PAST infections even if the tree is clean now):"
+    echo "  --history          Walk git history of every repo in the scan (all refs + reflog +"
+    echo "                     unreachable commits) looking for: compromised package versions in"
+    echo "                     historical manifests/lockfiles, IOC filenames that were later"
+    echo "                     removed, historical blobs matching known-malicious SHA-256 hashes,"
+    echo "                     Shai-Hulud branch names in refs/reflog, campaign IoC strings"
+    echo "                     introduced/removed by past commits, and force-pushed-away commits"
+    echo "                     carrying IOC files. Findings are HIGH risk: a past infection means"
+    echo "                     credentials valid at that time must be treated as compromised."
+    echo "                     Combine with --check-host to ALSO scan user-level package-manager"
+    echo "                     caches (~/.npm/_cacache, yarn, pip wheels, bun) for compromised"
+    echo "                     versions that were downloaded at some point."
+    echo "  --history-depth N  Commits per repo covered by the --history walks"
+    echo "                     (default: ${HISTORY_DEPTH}, 0 = unlimited)."
     echo "  --parallelism N    Set the number of threads to use for parallelized steps (current: ${PARALLELISM})"
     echo "  --save-log FILE    Save all detected file paths to FILE, grouped by severity"
     echo "                     Output format: # HIGH / # MEDIUM / # LOW headers with file paths"
@@ -823,6 +855,8 @@ usage() {
     echo "EXAMPLES:"
     echo "  $0 /path/to/your/project                    # Core Shai-Hulud detection only"
     echo "  $0 --paranoid /path/to/your/project         # Core + advanced security checks"
+    echo "  $0 --history /path/to/your/project          # Also hunt PAST infections in git history"
+    echo "  $0 --history --check-host /path/to/project  # ... plus package-manager cache forensics"
     echo "  $0 --save-log report.log /path/to/project   # Save findings to file"
     echo "  $0 --use-ripgrep /path/to/your/project      # Force ripgrep for testing"
     echo "  $0 --bulk ~/dev ~/Desktop/Projects          # Scan every project found under both dirs"
@@ -1054,9 +1088,12 @@ collect_all_files() {
         \) -type f 2>/dev/null || true
     } > "$TEMP_DIR/all_files_raw.txt"
 
-    # Also collect directories in a separate operation (silent)
+    # Also collect directories in a separate operation (silent).
+    # Note: the sed must sit OUTSIDE the ||-fallback — "find || true | sed" parses
+    # as "find || { true | sed; }", which left raw "/.git" paths in git_repos.txt
+    # and silently disabled the repo-dir-based checks that consume it.
     {
-        find "$scan_dir" -name ".git" -type d 2>/dev/null || true | sed 's|/.git$||'
+        find "$scan_dir" -name ".git" -type d 2>/dev/null | sed 's|/\.git$||' || true
     } > "$TEMP_DIR/git_repos.txt"
 
     {
@@ -4182,6 +4219,540 @@ check_git_branches() {
     fi
 }
 
+# =============================================================================
+# Historical forensics (--history)
+# =============================================================================
+# The live checks above answer "is this tree infected NOW?". A worm that was
+# installed, ran, and was later cleaned up (lockfile fixed, payload deleted,
+# branch force-pushed away) leaves NO live artifact — but it leaves git objects.
+# --history walks every repo's full object graph (all refs, plus reflog-only
+# and unreachable commits) hunting for evidence the repo was infected in the
+# PAST. Any hit is HIGH risk: credentials that existed on this machine at that
+# time must be treated as compromised even though the tree is clean today.
+
+# IOC basenames worth flagging when they EVER appeared in git history, even if
+# since removed. Mirrors the live-file inventory in collect_all_files(), minus
+# names too generic to be meaningful as a pathname-only historical signal
+# (index.js, cat.py, data.json, CLAUDE.md, .cursorrules, ...) — those are only
+# actionable live, where hash/content context is available.
+_HISTORY_IOC_BASENAMES=(
+    "shai-hulud-workflow.yml"
+    "shai-hulud.yaml"
+    "setup_bun.js" "bun_installer.js" "bun_environment.js" "environment_source.js"
+    "actionsSecrets.json"
+    "3nvir0nm3nt.json" "cl0vd.json" "c9nt3nts.json" "pigS3cr3ts.json"
+    "router_init.js" "tanstack_runner.js"
+    "gh-token-monitor.sh" "com.user.gh-token-monitor.plist" "gh-token-monitor.service"
+    "kitty-monitor.sh" "com.user.kitty-monitor.plist" "kitty-monitor.service"
+    "b02e30.js" "6ad264.js" "49554fde7424c31c.js" "rope.pyz"
+    "pgmonitor.py" "pgsql-monitor.service"
+    "template-web.js" "node-ipc.cjs" "bw1.js" "trap-core.js"
+)
+
+# Basenames whose HISTORICAL blob content is worth hashing against
+# MALICIOUS_HASHLIST. Kept to campaign-specific artifact names plus the small
+# loader names the waves reuse (setup.mjs/setup.cjs/bundle.js/binding.gyp);
+# ubiquitous names (index.js, main.js, package.json) would flood the per-repo
+# blob budget with legitimate revisions for near-zero extra signal.
+_HISTORY_HASH_BASENAMES=(
+    "setup_bun.js" "bun_installer.js" "bun_environment.js" "environment_source.js"
+    "router_init.js" "tanstack_runner.js"
+    "node-ipc.cjs" "bw1.js" "trap-core.js"
+    "b02e30.js" "6ad264.js" "49554fde7424c31c.js" "rope.pyz"
+    "pgmonitor.py" "template-web.js"
+    "bundle.js" "setup.mjs" "setup.cjs" "setup.pth" "binding.gyp"
+    "math_init.js" "Math_Symbol.js" "jia.js" "art.js" "cat.py"
+)
+
+# Campaign IoC literals worth a pickaxe (-S) walk: each is specific enough that
+# its introduction OR removal by a past commit is a finding on its own. Kept
+# short — every entry costs one bounded history diff per repo.
+_HISTORY_IOC_STRINGS=(
+    "webhook.site/bb8ca5f6-4175-45d2-b042-fc9ebb8170b7"
+    "webhook.site/8d334534-1c63-4f4f-a0d7-95c446c8b233"
+    "npm-cache.com"
+    "IfYouRevokeThisTokenItWillWipeTheComputerOfTheOwner"
+    "A Mini Shai-Hulud has Appeared"
+    "niagA oG eW ereH :duluH-iahS"
+    "Shai-Hulud: Here We Go Again"
+    "audit.checkmarx.cx"
+    "RevokeAndItGoesKaboom"
+)
+
+# Per-repo work budgets. History walks are bounded twice: HISTORY_DEPTH caps the
+# commits considered, and these cap the object-level work derived from them, so
+# one pathological repo can't stall the whole scan.
+_HISTORY_MAX_MANIFEST_BLOBS=500   # unique historical manifest/lockfile blobs parsed
+_HISTORY_MAX_HASH_BLOBS=300       # unique historical payload-name blobs sha256'd
+_HISTORY_MAX_LOST_COMMITS=100     # reflog-only/unreachable commits tree-scanned
+
+# Function: _history_extract_blob_packages
+# Purpose: Extract "eco:name:version" triples from one historical manifest blob
+# Args: $1 = path of the blob within the repo (basename selects the parser)
+#       $2 = file holding the blob content
+# Returns: Echoes one map-key-shaped triple per line (npm:… / pypi:…)
+_history_extract_blob_packages() {
+    local blob_path="$1"
+    local blob_file="$2"
+    local base
+    base=$(basename "$blob_path")
+
+    case "$base" in
+        package.json)
+            # Same explode-then-scan parser as check_packages (inline JSON safe).
+            # optionalDependencies is included: the May 19 atool wave delivered
+            # its payload through one, and exact-version map lookups cannot FP.
+            awk '
+                { buf = buf $0 "\n" }
+                END {
+                    gsub(/[{}]/, "\n&\n", buf)
+                    gsub(/,/, "\n", buf)
+                    n = split(buf, lines, "\n")
+                    flag = 0
+                    for (i = 1; i <= n; i++) {
+                        line = lines[i]
+                        if (line ~ /"(dependencies|devDependencies|optionalDependencies)"[[:space:]]*:/) { flag = 1; continue }
+                        if (line ~ /^[[:space:]]*\}/) { flag = 0; continue }
+                        if (flag && line ~ /^[[:space:]]*"[^"]+"[[:space:]]*:/) {
+                            name = line; sub(/^[[:space:]]*"/, "", name); sub(/".*$/, "", name)
+                            ver = line; sub(/^[[:space:]]*"[^"]+"[[:space:]]*:[[:space:]]*"/, "", ver); sub(/".*$/, "", ver)
+                            if (length(name) > 0 && ver ~ /^[0-9]/) print "npm:" name ":" ver
+                        }
+                    }
+                }
+            ' "$blob_file" 2>/dev/null || true
+            ;;
+        package-lock.json|pnpm-lock.yaml)
+            local lock_src="$blob_file"
+            if [[ "$base" == "pnpm-lock.yaml" ]]; then
+                lock_src="$blob_file.plock"
+                transform_pnpm_yaml "$blob_file" > "$lock_src" 2>/dev/null || true
+            fi
+            # Same block parser as check_package_integrity.
+            awk '
+                /^[[:space:]]*"node_modules\/[^"]+":/ {
+                    gsub(/.*"node_modules\//, "")
+                    gsub(/".*/, "")
+                    current_pkg = $0
+                    in_block = 1
+                    next
+                }
+                /^[[:space:]]*"[^"]+":.*\{/ && !in_block {
+                    gsub(/^[[:space:]]*"/, "")
+                    gsub(/".*/, "")
+                    if ($0 !~ /^(name|version|resolved|integrity|dependencies|devDependencies|engines|funding|bin|peerDependencies|packages)$/) {
+                        current_pkg = $0
+                        in_block = 1
+                    }
+                    next
+                }
+                in_block && /"version":/ {
+                    gsub(/.*"version"[[:space:]]*:[[:space:]]*"/, "")
+                    gsub(/".*/, "")
+                    if (current_pkg != "" && $0 ~ /^[0-9]/) {
+                        print "npm:" current_pkg ":" $0
+                    }
+                    in_block = 0
+                    current_pkg = ""
+                }
+                in_block && /^[[:space:]]*\}/ {
+                    in_block = 0
+                    current_pkg = ""
+                }
+            ' "$lock_src" 2>/dev/null || true
+            [[ "$base" == "pnpm-lock.yaml" ]] && rm -f "$blob_file.plock"
+            ;;
+        yarn.lock)
+            # yarn v1 format: "name@range[, name@range]:" header, then a
+            # two-space-indented `version "x.y.z"` line. Name = header key up
+            # to the LAST "@" (keeps "@scope/name" intact).
+            awk '
+                /^[^#[:space:]].*:[[:space:]]*$/ {
+                    key = $0
+                    sub(/:[[:space:]]*$/, "", key)
+                    split(key, ks, ",")
+                    k = ks[1]
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+                    gsub(/^"|"$/, "", k)
+                    name = ""
+                    if (match(k, /@[^@]*$/) > 1) name = substr(k, 1, RSTART - 1)
+                    next
+                }
+                /^[[:space:]]+version[[:space:]]/ {
+                    v = $0
+                    sub(/^[[:space:]]+version[[:space:]]*"?/, "", v)
+                    sub(/".*$/, "", v)
+                    if (name != "" && v ~ /^[0-9]/) print "npm:" name ":" v
+                    name = ""
+                }
+            ' "$blob_file" 2>/dev/null || true
+            ;;
+        *)
+            # requirements*.txt: exact pins only ("name==1.2.3"), PEP 503-ish
+            # normalization (lowercase, "_" -> "-") to match pypi: list entries.
+            awk '
+                /^[[:space:]]*[A-Za-z0-9][A-Za-z0-9_.-]*[[:space:]]*==[[:space:]]*[0-9]/ {
+                    line = $0
+                    sub(/[[:space:]]*#.*$/, "", line)
+                    sub(/;.*$/, "", line)
+                    split(line, parts, "==")
+                    name = parts[1]; ver = parts[2]
+                    gsub(/[[:space:]]/, "", name)
+                    gsub(/[[:space:]]/, "", ver)
+                    name = tolower(name); gsub(/_/, "-", name)
+                    if (name != "" && ver != "") print "pypi:" name ":" ver
+                }
+            ' "$blob_file" 2>/dev/null || true
+            ;;
+    esac
+}
+
+# Function: check_git_history
+# Purpose: Hunt PAST infections in git object history (opt-in via --history)
+# Args: $1 = scan_dir (directory being scanned; repos come from git_repos.txt)
+# Modifies: $TEMP_DIR/history_compromised.txt  (compromised versions in old manifests)
+#           $TEMP_DIR/history_ioc_files.txt    (IOC filenames / blob hashes / IoC strings)
+#           $TEMP_DIR/history_refs.txt         (Shai-Hulud refs + reflog entries)
+#           $TEMP_DIR/history_commit_objects.txt (lost commits carrying IOCs)
+#           $TEMP_DIR/history_rewrite_stats.txt  (informational rewrite evidence)
+# Returns: Populates the history_* findings files (reported as HIGH risk)
+check_git_history() {
+    local scan_dir=$1
+
+    if ! command -v git >/dev/null 2>&1; then
+        print_status "$YELLOW" "   ⚠️  --history requested but git is not installed; skipping git-history forensics."
+        return 0
+    fi
+
+    local depth_label="last $HISTORY_DEPTH commits"
+    [[ "$HISTORY_DEPTH" -eq 0 ]] && depth_label="full history"
+    print_status "$BLUE" "   Checking git history for past infections ($depth_label per repo)..."
+
+    # sha256 tool, mirroring check_file_hashes' macOS fallback.
+    local hash_cmd="sha256sum"
+    if shasum -a 256 /dev/null &>/dev/null; then
+        hash_cmd="shasum -a 256"
+    fi
+    printf '%s\n' "${MALICIOUS_HASHLIST[@]}" > "$TEMP_DIR/history_hashlist.txt"
+
+    # Regex over tree paths for the lost-commit scan: (^|/)(name1|name2|...)$
+    local ioc_regex_names
+    ioc_regex_names=$(printf '%s\n' "${_HISTORY_IOC_BASENAMES[@]}" | sed 's/\./\\./g' | paste -sd'|' -)
+    local ioc_path_regex="(^|/)(${ioc_regex_names})\$"
+
+    local repo
+    while IFS= read -r repo; do
+        [[ -n "$repo" && -d "$repo" ]] || continue
+        git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || continue
+
+        # Depth bound for every rev walk in this repo (0 = unlimited). -n alone
+        # caps DISPLAYED commits, not traversal — pathspec/pickaxe walks would
+        # still crawl full history hunting for the Nth match. So we also resolve
+        # the committer date of the oldest of the newest HISTORY_DEPTH commits
+        # and pass it as --since, which actually stops the traversal.
+        local -a walk_args=()
+        if [[ "$HISTORY_DEPTH" -gt 0 ]]; then
+            walk_args=(-n "$HISTORY_DEPTH")
+            local cutoff_ts
+            cutoff_ts=$(git -C "$repo" log --all --reflog -n "$HISTORY_DEPTH" --format=%ct 2>/dev/null | tail -1 || true)
+            [[ "$cutoff_ts" =~ ^[0-9]+$ ]] && walk_args+=("--since=@$cutoff_ts")
+        fi
+
+        # -------------------------------------------------------------------
+        # (1) Shai-Hulud ref names — current refs (incl. packed + remotes +
+        # tags) AND the HEAD reflog, which remembers checkouts of branches
+        # that were deleted afterwards. "-migration" alone is NOT matched
+        # here: ordinary repos legitimately have db/data migration branches.
+        # -------------------------------------------------------------------
+        local ref
+        while IFS= read -r ref; do
+            [[ -z "$ref" ]] && continue
+            echo "$repo:Git ref matches Shai-Hulud pattern: $ref" >> "$TEMP_DIR/history_refs.txt"
+        done < <(git -C "$repo" for-each-ref --format='%(refname)' 2>/dev/null | grep -iE 'sha[i1][-_]?hulud' | head -5 || true)
+
+        local rentry
+        while IFS= read -r rentry; do
+            [[ -z "$rentry" ]] && continue
+            echo "$repo:HEAD reflog references a Shai-Hulud branch (deleted branches leave this trace): $rentry" >> "$TEMP_DIR/history_refs.txt"
+        done < <(git -C "$repo" log -g --date=short --format='%gd %gs' HEAD 2>/dev/null | grep -iE 'sha[i1][-_]?hulud' | head -5 || true)
+
+        # -------------------------------------------------------------------
+        # (2) Compromised package versions in HISTORICAL manifests/lockfiles.
+        # One bounded `log --raw` walk over all refs + reflog surfaces every
+        # distinct manifest blob ever committed; each unique blob is parsed
+        # once and checked against the compromised map (npm + pypi).
+        # -------------------------------------------------------------------
+        local blob_tmp="$TEMP_DIR/history_blob.$$"
+        local -A hist_seen=()
+        local blob bpath bcommit bdate triple
+        while IFS='|' read -r blob bpath bcommit bdate; do
+            [[ -z "$blob" ]] && continue
+            git -C "$repo" cat-file blob "$blob" > "$blob_tmp" 2>/dev/null || continue
+            while IFS= read -r triple; do
+                [[ -z "$triple" ]] && continue
+                if [[ -v COMPROMISED_PACKAGES_MAP["$triple"] ]]; then
+                    local t_rest="${triple#*:}"
+                    local t_name="${t_rest%:*}"
+                    local t_ver="${t_rest##*:}"
+                    local dedupe_key="$bpath|$triple"
+                    [[ -n "${hist_seen[$dedupe_key]:-}" ]] && continue
+                    hist_seen[$dedupe_key]=1
+                    echo "$repo:Compromised package in git HISTORY: $t_name@$t_ver in $bpath (commit ${bcommit:0:12}, $bdate)" >> "$TEMP_DIR/history_compromised.txt"
+                fi
+            done < <(_history_extract_blob_packages "$bpath" "$blob_tmp")
+        done < <(git -C "$repo" log --all --reflog "${walk_args[@]}" --raw --no-abbrev --no-renames \
+                     --diff-filter=AM --date=short --format='@@C %H %cd' -- \
+                     '*package.json' '*package-lock.json' '*yarn.lock' '*pnpm-lock.yaml' '*requirements*.txt' 2>/dev/null | \
+                 awk '
+                     /^@@C / { commit = $2; cdate = $3; next }
+                     /^:/ {
+                         tab = index($0, "\t"); if (tab == 0) next
+                         path = substr($0, tab + 1)
+                         n = split(substr($0, 1, tab - 1), f, " ")
+                         sha = f[4]
+                         if (sha ~ /^0+$/) next
+                         if (!(sha in seen)) { seen[sha] = 1; print sha "|" path "|" commit "|" cdate }
+                     }
+                 ' | head -n "$_HISTORY_MAX_MANIFEST_BLOBS" || true)
+        rm -f "$blob_tmp"
+
+        # -------------------------------------------------------------------
+        # (3) IOC filenames that ever existed in history (added OR modified),
+        # even if deleted since. Pathspec wildcards match across "/".
+        # -------------------------------------------------------------------
+        local -a ioc_pathspecs=()
+        local iocname
+        for iocname in "${_HISTORY_IOC_BASENAMES[@]}"; do
+            ioc_pathspecs+=("*$iocname")
+        done
+        ioc_pathspecs+=("*.github/workflows/formatter_*.yml")
+
+        local iline
+        while IFS= read -r iline; do
+            [[ -z "$iline" ]] && continue
+            local i_sha="${iline%%|*}"
+            local i_rest="${iline#*|}"
+            local i_date="${i_rest%%|*}"
+            local i_path="${i_rest#*|}"
+            echo "$repo:Shai-Hulud IOC filename in git HISTORY: $i_path (commit ${i_sha:0:12}, $i_date)" >> "$TEMP_DIR/history_ioc_files.txt"
+        done < <(git -C "$repo" log --all --reflog "${walk_args[@]}" --diff-filter=AM --date=short \
+                     --format='@@C %H %cd' --name-only -- "${ioc_pathspecs[@]}" 2>/dev/null | \
+                 awk '
+                     /^@@C / { commit = $2; cdate = $3; next }
+                     NF && !(($0) in seen) { seen[$0] = 1; print commit "|" cdate "|" $0 }
+                 ' | head -50 || true)
+
+        # -------------------------------------------------------------------
+        # (4) Historical blobs at payload-shaped paths, hashed against
+        # MALICIOUS_HASHLIST. Catches a payload that was committed and later
+        # deleted or replaced — the blob object survives in the odb.
+        # -------------------------------------------------------------------
+        local -a hash_pathspecs=()
+        for iocname in "${_HISTORY_HASH_BASENAMES[@]}"; do
+            hash_pathspecs+=("*$iocname")
+        done
+
+        while IFS='|' read -r blob bpath bcommit bdate; do
+            [[ -z "$blob" ]] && continue
+            local blob_hash
+            blob_hash=$(git -C "$repo" cat-file blob "$blob" 2>/dev/null | $hash_cmd 2>/dev/null | awk '{print $1}') || true
+            [[ -z "$blob_hash" ]] && continue
+            if grep -qxF "$blob_hash" "$TEMP_DIR/history_hashlist.txt" 2>/dev/null; then
+                echo "$repo:Known-malicious payload in git HISTORY (SHA-256 match): $bpath (commit ${bcommit:0:12}, $bdate, sha256 $blob_hash)" >> "$TEMP_DIR/history_ioc_files.txt"
+            fi
+        done < <(git -C "$repo" log --all --reflog "${walk_args[@]}" --raw --no-abbrev --no-renames \
+                     --diff-filter=AM --date=short --format='@@C %H %cd' -- "${hash_pathspecs[@]}" 2>/dev/null | \
+                 awk '
+                     /^@@C / { commit = $2; cdate = $3; next }
+                     /^:/ {
+                         tab = index($0, "\t"); if (tab == 0) next
+                         path = substr($0, tab + 1)
+                         n = split(substr($0, 1, tab - 1), f, " ")
+                         sha = f[4]
+                         if (sha ~ /^0+$/) next
+                         if (!(sha in seen)) { seen[sha] = 1; print sha "|" path "|" commit "|" cdate }
+                     }
+                 ' | head -n "$_HISTORY_MAX_HASH_BLOBS" || true)
+
+        # -------------------------------------------------------------------
+        # (5) Campaign IoC strings introduced/removed by past commits
+        # (pickaxe). A string that is GONE from the tree still shows up here,
+        # on the commit that added it and the one that cleaned it up.
+        # -------------------------------------------------------------------
+        local pat
+        for pat in "${_HISTORY_IOC_STRINGS[@]}"; do
+            while IFS= read -r iline; do
+                [[ -z "$iline" ]] && continue
+                local p_sha="${iline%%|*}"
+                local p_rest="${iline#*|}"
+                local p_date="${p_rest%%|*}"
+                local p_path="${p_rest#*|}"
+                echo "$repo:Campaign IoC string in git HISTORY ('$pat'): $p_path (commit ${p_sha:0:12}, $p_date)" >> "$TEMP_DIR/history_ioc_files.txt"
+            done < <(git -C "$repo" log --all --reflog "${walk_args[@]}" -S"$pat" --date=short \
+                         --format='@@C %H %cd' --name-only 2>/dev/null | \
+                     awk '
+                         /^@@C / { commit = $2; cdate = $3; next }
+                         NF && !(($0) in seen) { seen[$0] = 1; print commit "|" cdate "|" $0 }
+                     ' | head -5 || true)
+        done
+
+        # -------------------------------------------------------------------
+        # (6) Lost commits: reachable only from reflogs (force-push, branch
+        # delete, amend) or fully unreachable (fsck). Rewriting history is
+        # exactly how a past infection gets hidden, so these commits' trees
+        # and subjects are checked for IOCs. The bare counts are recorded as
+        # informational context only — every rebase creates lost commits, so
+        # their mere existence is NOT a finding.
+        # -------------------------------------------------------------------
+        local -a lost_commits=()
+        local lc
+        while IFS= read -r lc; do
+            [[ -n "$lc" ]] && lost_commits+=("$lc")
+        done < <(git -C "$repo" rev-list --reflog --not --branches --tags --remotes 2>/dev/null | head -n 200 || true)
+        local reflog_only_count=${#lost_commits[@]}
+
+        local unreachable_count=0
+        while IFS= read -r lc; do
+            [[ -n "$lc" ]] || continue
+            lost_commits+=("$lc")
+            ((unreachable_count++)) || true
+        done < <(git -C "$repo" fsck --connectivity-only --unreachable --no-progress 2>/dev/null | \
+                 awk '$1 == "unreachable" && $2 == "commit" { print $3 }' | head -n 200 || true)
+
+        if [[ $((reflog_only_count + unreachable_count)) -gt 0 ]]; then
+            echo "$repo:$reflog_only_count reflog-only + $unreachable_count unreachable commit(s) (history was rewritten at some point)" >> "$TEMP_DIR/history_rewrite_stats.txt"
+        fi
+
+        local -A seen_trees=()
+        local scanned_lost=0
+        for lc in "${lost_commits[@]}"; do
+            [[ $scanned_lost -ge $_HISTORY_MAX_LOST_COMMITS ]] && break
+            local tree
+            tree=$(git -C "$repo" log -1 --format='%T' "$lc" 2>/dev/null) || continue
+            [[ -z "$tree" || -n "${seen_trees[$tree]:-}" ]] && continue
+            seen_trees[$tree]=1
+            ((scanned_lost++)) || true
+
+            local subj
+            subj=$(git -C "$repo" log -1 --format='%s' "$lc" 2>/dev/null || true)
+            if grep -qiE 'sha[i1][-_]?hulud' <<< "$subj"; then
+                echo "$repo:Lost commit ${lc:0:12} has a Shai-Hulud commit message: $subj" >> "$TEMP_DIR/history_commit_objects.txt"
+            fi
+
+            local lpath
+            while IFS= read -r lpath; do
+                [[ -z "$lpath" ]] && continue
+                echo "$repo:Lost commit ${lc:0:12} (force-pushed away or unreachable) carries IOC file: $lpath" >> "$TEMP_DIR/history_commit_objects.txt"
+            done < <(git -C "$repo" ls-tree -r --name-only "$lc" 2>/dev/null | grep -E "$ioc_path_regex" | head -5 || true)
+        done
+    done < "$TEMP_DIR/git_repos.txt"
+}
+
+# Function: check_package_caches
+# Purpose: Scan user-level package-manager caches for compromised versions that
+#          were DOWNLOADED at some point (evidence of past exposure, even if no
+#          project references them anymore). Opt-in: requires BOTH --history and
+#          --check-host, matching the convention that anything reading outside
+#          the scan directory needs explicit host-level consent.
+# Args: None (reads $HOME)
+# Modifies: $TEMP_DIR/cache_findings.txt
+# Returns: Populates cache_findings.txt (reported as HIGH risk)
+check_package_caches() {
+    print_status "$BLUE" "   Checking user-level package caches for compromised versions..."
+
+    # ---- Build per-cache fixed-string pattern files from the compromised list.
+    # npm entries -> "name/-/basename-version.tgz" (registry tarball path as it
+    # appears in ~/.npm/_cacache index entries), "name-flat-version-" (yarn v1
+    # cache dir names), "name-flat-npm-version-" (yarn berry cache zips) and
+    # "name@version" (bun cache entries). pypi entries -> "name_norm-version-"
+    # (pip wheel cache filenames, PEP 427: "-" in names becomes "_").
+    awk -F: '
+        /^[[:space:]]*#/ || NF < 2 { next }
+        {
+            name = ""; ver = ""
+            if ($1 == "npm" && NF >= 3)      { name = $2; ver = $3 }
+            else if ($1 ~ /^(pypi|composer|crates|go|hex|gem)$/) { next }
+            else if ($0 ~ /^[@a-zA-Z0-9]/)   { name = $1; ver = $2 }
+            if (name == "" || ver !~ /^[0-9]/) { next }
+
+            base = name
+            sub(/^@[^\/]+\//, "", base)                 # tarball basename drops the scope
+            flat = name; gsub(/\//, "-", flat)          # "@scope/name" -> "@scope-name"
+
+            print name "/-/" base "-" ver ".tgz" > TGZ
+            print "npm-" flat "-" ver "-"        > YARN1
+            print flat "-npm-" ver "-"           > BERRY
+            print name "@" ver                   > BUN
+        }
+    ' TGZ="$TEMP_DIR/cache_pat_tgz.txt" YARN1="$TEMP_DIR/cache_pat_yarn1.txt" \
+      BERRY="$TEMP_DIR/cache_pat_berry.txt" BUN="$TEMP_DIR/cache_pat_bun.txt" \
+      "$COMPROMISED_PACKAGES_FILE" 2>/dev/null || true
+
+    awk -F: '
+        /^[[:space:]]*#/ { next }
+        $1 == "pypi" && NF >= 3 {
+            name = tolower($2); gsub(/[-.]/, "_", name)
+            print name "-" $3 "-"
+        }
+    ' "$COMPROMISED_PACKAGES_FILE" > "$TEMP_DIR/cache_pat_pip.txt" 2>/dev/null || true
+
+    # ---- npm: ~/.npm/_cacache/index-v5 stores JSON index entries containing the
+    # registry tarball URL of everything ever downloaded by npm on this machine.
+    local npm_index="$HOME/.npm/_cacache/index-v5"
+    if [[ -d "$npm_index" && -s "$TEMP_DIR/cache_pat_tgz.txt" ]]; then
+        local m
+        while IFS= read -r m; do
+            [[ -z "$m" ]] && continue
+            echo "$npm_index:npm cache holds a compromised package tarball: $m (this version was DOWNLOADED on this machine at some point)" >> "$TEMP_DIR/cache_findings.txt"
+        done < <(grep -RhoF -f "$TEMP_DIR/cache_pat_tgz.txt" "$npm_index" 2>/dev/null | sort -u | head -50 || true)
+    fi
+
+    # ---- yarn v1 (classic): cache dirs named npm-<flat-name>-<version>-<hash>.
+    local yarn_dir
+    for yarn_dir in "$HOME/.cache/yarn" "$HOME/Library/Caches/Yarn"; do
+        [[ -d "$yarn_dir" && -s "$TEMP_DIR/cache_pat_yarn1.txt" ]] || continue
+        local m
+        while IFS= read -r m; do
+            [[ -z "$m" ]] && continue
+            echo "$yarn_dir:yarn cache holds a compromised package: $(basename "$m")" >> "$TEMP_DIR/cache_findings.txt"
+        done < <(find "$yarn_dir" -maxdepth 3 -type d 2>/dev/null | grep -F -f "$TEMP_DIR/cache_pat_yarn1.txt" | sort -u | head -50 || true)
+    done
+
+    # ---- yarn berry: global cache zips named <flat-name>-npm-<version>-<hash>.zip.
+    local berry_dir="$HOME/.yarn/berry/cache"
+    if [[ -d "$berry_dir" && -s "$TEMP_DIR/cache_pat_berry.txt" ]]; then
+        local m
+        while IFS= read -r m; do
+            [[ -z "$m" ]] && continue
+            echo "$berry_dir:yarn berry cache holds a compromised package: $(basename "$m")" >> "$TEMP_DIR/cache_findings.txt"
+        done < <(find "$berry_dir" -maxdepth 1 -name '*.zip' 2>/dev/null | grep -F -f "$TEMP_DIR/cache_pat_berry.txt" | sort -u | head -50 || true)
+    fi
+
+    # ---- bun: ~/.bun/install/cache entries keyed <name>@<version>.
+    local bun_dir="$HOME/.bun/install/cache"
+    if [[ -d "$bun_dir" && -s "$TEMP_DIR/cache_pat_bun.txt" ]]; then
+        local m
+        while IFS= read -r m; do
+            [[ -z "$m" ]] && continue
+            echo "$bun_dir:bun cache holds a compromised package: ${m#"$bun_dir"/}" >> "$TEMP_DIR/cache_findings.txt"
+        done < <(find "$bun_dir" -maxdepth 3 2>/dev/null | grep -F -f "$TEMP_DIR/cache_pat_bun.txt" | sort -u | head -50 || true)
+    fi
+
+    # ---- pip: wheel cache keeps real wheel filenames (name_norm-version-*.whl).
+    local pip_dir
+    for pip_dir in "$HOME/.cache/pip/wheels" "$HOME/Library/Caches/pip/wheels"; do
+        [[ -d "$pip_dir" && -s "$TEMP_DIR/cache_pat_pip.txt" ]] || continue
+        local m
+        while IFS= read -r m; do
+            [[ -z "$m" ]] && continue
+            echo "$pip_dir:pip wheel cache holds a compromised package: $(basename "$m")" >> "$TEMP_DIR/cache_findings.txt"
+        done < <(find "$pip_dir" -name '*.whl' -type f 2>/dev/null | grep -F -f "$TEMP_DIR/cache_pat_pip.txt" | sort -u | head -50 || true)
+    done
+
+    # pnpm's store is content-addressed (no package names on disk), so it cannot
+    # be checked by name; covered indirectly via historical pnpm-lock.yaml blobs.
+}
+
 # Function: get_file_context
 # Purpose: Classify file context for risk assessment (node_modules, source, build, etc.)
 # Args: $1 = file_path (path to file)
@@ -4500,10 +5071,10 @@ check_package_integrity() {
                     next
                 }
                 # Match "package-name": { in packages section (older format)
-                /^[[:space:]]*"[^"\/]+":.*\{/ && !in_block {
+                /^[[:space:]]*"[^"]+":.*\{/ && !in_block {
                     gsub(/^[[:space:]]*"/, "")
                     gsub(/".*/, "")
-                    if ($0 !~ /^(name|version|resolved|integrity|dependencies|devDependencies|engines|funding|bin|peerDependencies)$/) {
+                    if ($0 !~ /^(name|version|resolved|integrity|dependencies|devDependencies|engines|funding|bin|peerDependencies|packages)$/) {
                         current_pkg = $0
                         in_block = 1
                     }
@@ -5046,6 +5617,13 @@ write_log_file() {
         # Shai-Hulud repos
         [[ -s "$TEMP_DIR/shai_hulud_repos.txt" ]] && cat "$TEMP_DIR/shai_hulud_repos.txt" || true
 
+        # Historical forensics findings (--history): repo/cache path before colon
+        [[ -s "$TEMP_DIR/history_compromised.txt" ]] && cut -d: -f1 "$TEMP_DIR/history_compromised.txt" || true
+        [[ -s "$TEMP_DIR/history_ioc_files.txt" ]] && cut -d: -f1 "$TEMP_DIR/history_ioc_files.txt" || true
+        [[ -s "$TEMP_DIR/history_refs.txt" ]] && cut -d: -f1 "$TEMP_DIR/history_refs.txt" || true
+        [[ -s "$TEMP_DIR/history_commit_objects.txt" ]] && cut -d: -f1 "$TEMP_DIR/history_commit_objects.txt" || true
+        [[ -s "$TEMP_DIR/cache_findings.txt" ]] && cut -d: -f1 "$TEMP_DIR/cache_findings.txt" || true
+
         # High-risk crypto patterns (extract from crypto_patterns.txt)
         if [[ -s "$TEMP_DIR/crypto_patterns.txt" ]]; then
             grep -E "(HIGH RISK|Known attacker wallet)" "$TEMP_DIR/crypto_patterns.txt" 2>/dev/null | cut -d: -f1 || true
@@ -5230,6 +5808,12 @@ write_json_file() {
         _jf_pathmsg HIGH "$TEMP_DIR/compromised_found.txt"
         _jf_pathmsg HIGH "$TEMP_DIR/trufflehog_activity.txt"
         _jf_path    HIGH "Shai-Hulud marker repository"                    "$TEMP_DIR/shai_hulud_repos.txt"
+        # Historical forensics (--history): file field is the repo/cache path.
+        _jf_pathmsg HIGH "$TEMP_DIR/history_compromised.txt"
+        _jf_pathmsg HIGH "$TEMP_DIR/history_ioc_files.txt"
+        _jf_pathmsg HIGH "$TEMP_DIR/history_refs.txt"
+        _jf_pathmsg HIGH "$TEMP_DIR/history_commit_objects.txt"
+        _jf_pathmsg HIGH "$TEMP_DIR/cache_findings.txt"
         [[ -s "$TEMP_DIR/crypto_patterns.txt" ]] && \
             grep -E "(HIGH RISK|Known attacker wallet)" "$TEMP_DIR/crypto_patterns.txt" 2>/dev/null | _jf_pathmsg_stdin HIGH || true
 
@@ -6115,6 +6699,106 @@ generate_report() {
         echo
     fi
 
+    # ---- Historical forensics findings (--history). All HIGH: the working tree
+    # may be clean TODAY, but these prove the repo/machine carried Shai-Hulud
+    # artifacts at some point in the past — every credential that existed on
+    # this machine during that window must be treated as compromised.
+    local _hist_any=false
+    local _hist_file
+    for _hist_file in history_compromised history_ioc_files history_refs history_commit_objects cache_findings; do
+        [[ -s "$TEMP_DIR/$_hist_file.txt" ]] && _hist_any=true
+    done
+
+    if [[ -s "$TEMP_DIR/history_compromised.txt" ]]; then
+        print_status "$RED" "🚨 HIGH RISK (HISTORY): Compromised package versions found in git history:"
+        while IFS= read -r entry; do
+            local repo_path="${entry%%:*}"
+            local reason="${entry#*:}"
+            echo "   - $reason"
+            echo "     Repo: $repo_path"
+            high_risk=$((high_risk+1))
+        done < "$TEMP_DIR/history_compromised.txt"
+        echo -e "   ${YELLOW}NOTE: The current working tree/lockfile may be clean — this version was${NC}"
+        echo -e "   ${YELLOW}COMMITTED at the time shown, so it was likely installed on dev/CI machines.${NC}"
+        echo
+    fi
+
+    if [[ -s "$TEMP_DIR/history_ioc_files.txt" ]]; then
+        print_status "$RED" "🚨 HIGH RISK (HISTORY): Shai-Hulud IOC artifacts found in git history:"
+        while IFS= read -r entry; do
+            local repo_path="${entry%%:*}"
+            local reason="${entry#*:}"
+            echo "   - $reason"
+            echo "     Repo: $repo_path"
+            high_risk=$((high_risk+1))
+        done < "$TEMP_DIR/history_ioc_files.txt"
+        echo
+    fi
+
+    if [[ -s "$TEMP_DIR/history_refs.txt" ]]; then
+        print_status "$RED" "🚨 HIGH RISK (HISTORY): Shai-Hulud git refs / reflog entries detected:"
+        while IFS= read -r entry; do
+            local repo_path="${entry%%:*}"
+            local reason="${entry#*:}"
+            echo "   - $reason"
+            echo "     Repo: $repo_path"
+            high_risk=$((high_risk+1))
+        done < "$TEMP_DIR/history_refs.txt"
+        echo -e "   ${YELLOW}NOTE: The worm creates a 'shai-hulud' branch to stage exfiltrated data.${NC}"
+        echo -e "   ${YELLOW}A reflog trace of one means the worm RAN here, even if the branch is gone.${NC}"
+        echo
+    fi
+
+    if [[ -s "$TEMP_DIR/history_commit_objects.txt" ]]; then
+        print_status "$RED" "🚨 HIGH RISK (HISTORY): Lost commits (force-pushed away / unreachable) carrying IOCs:"
+        while IFS= read -r entry; do
+            local repo_path="${entry%%:*}"
+            local reason="${entry#*:}"
+            echo "   - $reason"
+            echo "     Repo: $repo_path"
+            high_risk=$((high_risk+1))
+        done < "$TEMP_DIR/history_commit_objects.txt"
+        echo -e "   ${YELLOW}NOTE: These commits are no longer on any branch — consistent with an infection${NC}"
+        echo -e "   ${YELLOW}that was cleaned up by rewriting history. Inspect with: git show <commit>${NC}"
+        echo
+    fi
+
+    if [[ -s "$TEMP_DIR/cache_findings.txt" ]]; then
+        print_status "$RED" "🚨 HIGH RISK (HISTORY): Compromised versions in user-level package caches:"
+        while IFS= read -r entry; do
+            local cache_path="${entry%%:*}"
+            local reason="${entry#*:}"
+            echo "   - $reason"
+            echo "     Cache: $cache_path"
+            high_risk=$((high_risk+1))
+        done < "$TEMP_DIR/cache_findings.txt"
+        echo -e "   ${YELLOW}NOTE: A cached compromised tarball proves this machine DOWNLOADED that version${NC}"
+        echo -e "   ${YELLOW}at some point (npm/yarn/bun/pip fetch on install). Purge the caches:${NC}"
+        echo -e "   ${YELLOW}  npm cache clean --force; yarn cache clean; bun pm cache rm; pip cache purge${NC}"
+        echo
+    fi
+
+    if [[ "$_hist_any" == "true" ]]; then
+        print_status "$RED" "    📋 PAST-INFECTION REMEDIATION: the tree being clean NOW is not the end of it."
+        print_status "$RED" "       1. Rotate every credential that existed on affected machines during the window"
+        print_status "$RED" "          (npm/GitHub tokens, SSH keys, cloud creds, .env secrets) — but check for an"
+        print_status "$RED" "          active dead-man's-switch service FIRST (--check-host) before revoking."
+        print_status "$RED" "       2. Audit npm/GitHub audit logs from the commit dates shown for worm publishes,"
+        print_status "$RED" "          rogue repos ('Shai-Hulud', '*-migration'), and unknown workflow runs."
+        print_status "$RED" "       3. Purge package caches and reinstall from clean lockfiles."
+        echo
+    fi
+
+    # Informational context (not a finding): rewritten-history evidence. Every
+    # rebase/amend produces lost commits, so bare counts never affect risk.
+    if [[ -s "$TEMP_DIR/history_rewrite_stats.txt" ]]; then
+        print_status "$BLUE" "ℹ️  HISTORY INFO: repos with rewritten-history evidence (normal for rebase workflows):"
+        while IFS= read -r entry; do
+            echo "   - ${entry%%:*}: ${entry#*:}"
+        done < "$TEMP_DIR/history_rewrite_stats.txt"
+        echo
+    fi
+
     total_issues=$((high_risk + medium_risk))
     local low_risk_count=0
     if [[ -s "$TEMP_DIR/low_risk_findings.txt" ]]; then
@@ -6586,6 +7270,11 @@ run_bulk_scan() {
     local child_flags=()
     [[ "$paranoid_mode" == "true" ]] && child_flags+=("--paranoid")
     [[ "$CHECK_SEMVER_RANGES" == "true" ]] && child_flags+=("--check-semver-ranges")
+    # Git-history forensics is per-repo, so it propagates. The cache half of
+    # --history needs --check-host, which --bulk deliberately does not propagate
+    # ($HOME caches are machine-level: scanning them once per project would just
+    # repeat the identical findings N times).
+    [[ "$HISTORY_MODE" == "true" ]] && child_flags+=("--history" "--history-depth" "$HISTORY_DEPTH")
     [[ -n "$ECOSYSTEM_OVERRIDE" ]] && child_flags+=("--ecosystem" "$ECOSYSTEM_OVERRIDE")
     child_flags+=("--parallelism" "$PARALLELISM")
     case "$GREP_TOOL" in
@@ -6889,6 +7578,25 @@ main() {
             --check-semver-ranges)
                 CHECK_SEMVER_RANGES=true
                 ;;
+            --history)
+                HISTORY_MODE=true
+                ;;
+            --history-depth)
+                re='^[0-9]+$'
+                if ! [[ $2 =~ $re ]]; then
+                    echo "${RED}error: --history-depth requires a non-negative integer (0 = unlimited)${NC}" >&2
+                    usage
+                fi
+                HISTORY_DEPTH=$2
+                shift
+                ;;
+            --history-depth=*)
+                HISTORY_DEPTH="${1#--history-depth=}"
+                if ! [[ $HISTORY_DEPTH =~ ^[0-9]+$ ]]; then
+                    echo "${RED}error: --history-depth= requires a non-negative integer (0 = unlimited)${NC}" >&2
+                    usage
+                fi
+                ;;
             --help|-h)
                 usage
                 ;;
@@ -7123,6 +7831,19 @@ main() {
         check_typosquatting "$scan_dir"
         check_network_exfiltration "$scan_dir"
         print_stage_complete "Paranoid mode checks"
+    fi
+
+    # Historical forensics (opt-in): hunt PAST infections in git object history,
+    # and — with --check-host consent — in user-level package-manager caches.
+    if [[ "$HISTORY_MODE" == "true" ]]; then
+        print_status "$BLUE" "[History] Running historical forensics..."
+        check_git_history "$scan_dir"
+        if [[ "$check_host" == "true" ]]; then
+            check_package_caches
+        else
+            print_status "$BLUE" "   Note: package-manager cache forensics skipped (needs --check-host alongside --history)."
+        fi
+        print_stage_complete "Historical forensics"
     fi
 
     # Generate report

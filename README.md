@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Shell](https://img.shields.io/badge/shell-Bash%205.0%2B-blue)](#requirements)
 [![Status](https://img.shields.io/badge/status-Active-success)](../../)
-[![Tests](https://img.shields.io/badge/tests-238%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-256%20passing-brightgreen)](#testing)
 [![Packages](https://img.shields.io/badge/compromised%20packages-3%2C460%2B-red)](compromised-packages.txt)
 [![Type](https://img.shields.io/badge/type-Security%20Tool-red)](#what-it-catches)
 [![Contributions](https://img.shields.io/badge/contributions-Welcome-orange)](#contributing)
@@ -127,6 +127,29 @@ shai-hulud-bulk-report-<timestamp>/
     └── <project>.console.txt     # full scan output, ANSI-stripped
 ```
 
+### Historical forensics (`--history`)
+
+The core checks answer *"is this tree infected NOW?"*. A worm that was installed, ran, and was later cleaned up (lockfile fixed, payload deleted, branch force-pushed away) leaves no live artifact — but it leaves git objects. `--history` walks every repo's object history (all refs, plus reflog-only and unreachable commits) hunting for evidence the repo was infected **in the past**:
+
+```bash
+./shai-hulud-detector.sh --history /path/to/project               # git-history forensics
+./shai-hulud-detector.sh --history --check-host /path/to/project  # + package-manager cache forensics
+./shai-hulud-detector.sh --history --history-depth 0 /path/to/project  # unbounded walk
+```
+
+What it looks for, per repository:
+
+- **Compromised versions in historical manifests** — every distinct `package.json` / `package-lock.json` / `yarn.lock` / `pnpm-lock.yaml` / `requirements*.txt` blob ever committed is parsed and checked against the compromised list, even if the current lockfile is clean.
+- **IOC filenames that were later deleted** — `shai-hulud-workflow.yml`, `router_init.js`, `setup_bun.js`, dead-man's-switch scripts, etc., anywhere in history.
+- **Known-malicious blobs** — historical file contents at payload-shaped paths (`bundle.js`, `setup.mjs`, `binding.gyp`, campaign artifact names) hashed against the malicious SHA-256 list.
+- **Shai-Hulud refs and reflog traces** — the worm's `shai-hulud` staging branch leaves a HEAD-reflog trace even after the branch is deleted.
+- **Campaign IoC strings** (pickaxe) — commits that introduced *or removed* wipe-threat markers, C2 domains, or beacon strings.
+- **Lost commits carrying IOCs** — commits that are only in the reflog or fully unreachable (force-push / amend / reset) whose trees contain IOC files: exactly the shape of an infection that was "cleaned up" by rewriting history.
+
+With `--check-host` consent it also scans user-level package caches (`~/.npm/_cacache` index, yarn classic/berry caches, bun cache, pip wheels) for compromised versions — a cached tarball proves that version was **downloaded on this machine** at some point, no matter what any project references today.
+
+All `--history` findings are **HIGH risk**: a clean tree today does not un-steal the credentials that existed during the infection window. The report prints a past-infection remediation order (dead-man's-switch check first, then rotation, log audits, cache purge). Walks are bounded to the most recent 1000 commits per repo by default (`--history-depth N`, `0` = unlimited). Evidence of rewritten history *without* IOCs (normal for rebase workflows) is reported as informational context only and never affects the exit code.
+
 ### Paranoid mode (`--paranoid`)
 
 Adds typosquatting detection and network-exfiltration heuristics on top of the core checks. These are general-purpose security signals, not Shai-Hulud-specific, and produce more false positives — useful for audits, not recommended for CI gating.
@@ -181,6 +204,8 @@ For CI gates and tooling that consume findings as data (rather than parsing cons
 | Flag | Effect |
 |---|---|
 | `--json FILE` | Write findings as structured JSON (severity/file/line/message + summary). Requires `jq`. |
+| `--history` | Historical forensics: hunt PAST infections in git history (+ package caches with `--check-host`). |
+| `--history-depth N` | Commits per repo covered by `--history` walks (default 1000, `0` = unlimited). |
 | `--check-semver-ranges` | Flag `^`/`~` ranges that could resolve to compromised versions (informational, LOW risk). |
 | `--ecosystem LIST` | Restrict checks to `npm`, `pypi`, `all`, or a comma-separated list. Default: auto-detect. |
 | `--parallelism N` | Threads for parallelisable steps. Defaults to your CPU count. |
@@ -196,7 +221,7 @@ For CI gates and tooling that consume findings as data (rather than parsing cons
 3. **Match** every resolved package version against `compromised-packages.txt` via a sorted set-intersection (`comm -12`).
 4. **Hash** priority files (`bundle.js`, `setup_bun.js`, `router_init.js`, `tanstack_runner.js`, `cat.py`, `node-ipc.cjs`, etc.) and compare against 20 known-malicious SHA-256s.
 5. **Grep** for content-pattern IoCs: C2 domains, threat-actor accounts, dead-man's-switch service names, wipe-threat strings, malicious commit SHAs, beacon strings, payload filenames, orphan-commit `optionalDependencies` patterns.
-6. **(Opt-in)** scan `$HOME` for persistence artifacts (`--check-host`); run typosquatting + network-exfil heuristics (`--paranoid`); flag latent semver-range risk (`--check-semver-ranges`).
+6. **(Opt-in)** scan `$HOME` for persistence artifacts (`--check-host`); run typosquatting + network-exfil heuristics (`--paranoid`); flag latent semver-range risk (`--check-semver-ranges`); walk git history and package caches for past infections (`--history`).
 7. **Report** in three severity tiers (HIGH/MEDIUM/LOW), with remediation order for the safety-critical findings.
 
 Detection is read-only. The script never modifies, deletes, or quarantines anything — manual review and remediation are on you.
@@ -253,7 +278,7 @@ To add new packages from a fresh advisory: append entries in that format, run `.
 ## Testing
 
 ```bash
-./run-tests.sh                          # full suite, 238 checks
+./run-tests.sh                          # full suite, 256 checks
 ./shai-hulud-detector.sh test-cases/<fixture-name>   # run one fixture manually
 ```
 
