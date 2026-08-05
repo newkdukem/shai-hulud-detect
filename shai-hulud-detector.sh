@@ -29,7 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPROMISED_PACKAGES_FILE="$SCRIPT_DIR/compromised-packages.txt"
 
 # Tool version (surfaced in --json output for downstream consumers)
-SCRIPT_VERSION="3.14.1"
+SCRIPT_VERSION="3.16.0"
 
 # Global temp directory for file-based storage
 TEMP_DIR=""
@@ -158,6 +158,8 @@ create_temp_dir() {
     touch "$TEMP_DIR/malicious_hashes.txt"
     touch "$TEMP_DIR/destructive_patterns.txt"
     touch "$TEMP_DIR/trufflehog_patterns.txt"
+    # Fast lockfile skim (--skim) findings
+    touch "$TEMP_DIR/skim_findings.txt"
 }
 
 # Function: cleanup_temp_files
@@ -207,6 +209,15 @@ GREP_TOOL=""
 
 # Semver range checking (opt-in via --check-semver-ranges flag)
 CHECK_SEMVER_RANGES=false
+
+# Fast lockfile skim (opt-in via --skim): before doing anything expensive, skim
+# every lockfile for dependency/sub-dependency NAMES that ever had a compromised
+# version — any version. A project depending on such a package (even at a safe
+# version) sits in that package's blast radius and deserves the deep scan; a
+# project whose whole dependency tree never touched a compromised package can
+# skip the deep scan entirely. No lockfiles at all -> fall back to manifest
+# names (declared deps, resolution unpinned).
+SKIM_MODE=false
 
 # Function: select_grep_tool
 # Purpose: Auto-select the best available grep tool (git-grep > ripgrep > grep)
@@ -784,6 +795,18 @@ usage() {
     echo "                     Off by default. CRITICAL: revoking a monitored GitHub token while"
     echo "                     the service is active is designed to trigger a destructive wipe;"
     echo "                     stop and remove the service before rotating credentials."
+    echo "  --skim             Fast pre-filter: skim every lockfile (package-lock.json, yarn.lock,"
+    echo "                     pnpm-lock.yaml, poetry.lock, uv.lock, Pipfile.lock, composer.lock,"
+    echo "                     Cargo.lock, go.sum, mix.lock, Gemfile.lock) for dependency or"
+    echo "                     sub-dependency NAMES that ever had a compromised version — ANY"
+    echo "                     version. No hits: exit 0 immediately, deep scan skipped (fast CI"
+    echo "                     path). Hits: print them as potential threats and automatically"
+    echo "                     escalate to the full deep scan; the deep scan's verdict decides"
+    echo "                     the exit code (a name hit at a safe locked version is reported as"
+    echo "                     informational only). With no lockfiles at all, declared manifest"
+    echo "                     dependency names are skimmed instead (resolution unpinned)."
+    echo "                     NOTE: a clean skim skips content-pattern checks too — run a full"
+    echo "                     scan periodically for complete coverage."
     echo "  --ecosystem LIST   Restrict ecosystem-specific checks to a comma-separated list."
     echo "                     Supported values: npm, pypi, all (default: auto-detect from"
     echo "                     marker files). Content-pattern checks always run regardless."
@@ -4544,6 +4567,452 @@ check_package_integrity() {
     done < <(tr '\n' '\0' < "$TEMP_DIR/lockfiles.txt")
 }
 
+# =============================================================================
+# Fast lockfile skim (--skim)
+# =============================================================================
+# A cheap pre-filter that answers one question before any expensive work: does
+# ANY dependency or sub-dependency in this tree carry a NAME that ever had a
+# compromised version? Version does not matter at this stage — if nodemon was
+# infected at any point and nodemon is anywhere in your lockfile, the project
+# sits in that package's blast radius and earns the full deep scan. A tree
+# whose resolved dependency set never touched a compromised package name skips
+# the deep scan entirely (fast CI path, exit 0).
+
+# Function: _skim_extract_lockfile
+# Purpose: Extract "eco:name<TAB>version" pairs from one lockfile
+# Args: $1 = lockfile path (basename selects the parser)
+# Returns: Echoes one pair per line; pypi names are PEP-503-normalized
+#          (lowercase, "_"/"." -> "-") to match the compromised list
+_skim_extract_lockfile() {
+    local lf="$1"
+    local base
+    base=$(basename "$lf")
+
+    case "$base" in
+        package-lock.json|pnpm-lock.yaml)
+            local src="$lf"
+            if [[ "$base" == "pnpm-lock.yaml" ]]; then
+                src="$TEMP_DIR/skim_pnpm.$$"
+                transform_pnpm_yaml "$lf" > "$src" 2>/dev/null || true
+            fi
+            # v2/v3 "node_modules/<name>" keys (rule 1) and v1 / pnpm-pseudo
+            # "<name>": { blocks (rule 2; admits "/" so scoped names match, with
+            # structural JSON keys excluded). Compact one-line entries
+            # ("key": { "version": "x" }) are handled inline — a minified
+            # lockfile must not become an evasion vector.
+            awk '
+                function emit_inline(line, pkg,    v) {
+                    v = line
+                    sub(/.*"version"[[:space:]]*:[[:space:]]*"/, "", v); sub(/".*/, "", v)
+                    if (pkg != "" && v ~ /^[0-9]/) print "npm:" pkg "\t" v
+                }
+                /^[[:space:]]*"node_modules\/[^"]+":/ {
+                    key = $0; sub(/^[[:space:]]*"/, "", key); sub(/".*/, "", key)
+                    sub(/^.*node_modules\//, "", key)
+                    if ($0 ~ /"version"[[:space:]]*:/) { emit_inline($0, key); next }
+                    pkg = key; in_block = 1; next
+                }
+                /^[[:space:]]*"[^"]+":[[:space:]]*\{/ && !in_block {
+                    key = $0; sub(/^[[:space:]]*"/, "", key); sub(/".*/, "", key)
+                    if (key !~ /^(name|version|resolved|integrity|dependencies|devDependencies|optionalDependencies|peerDependencies|engines|funding|bin|packages|requires|scripts|overrides)$/) {
+                        if ($0 ~ /"version"[[:space:]]*:/) { emit_inline($0, key); next }
+                        pkg = key; in_block = 1
+                    }
+                    next
+                }
+                in_block && /"version":/ {
+                    v = $0; sub(/.*"version"[[:space:]]*:[[:space:]]*"/, "", v); sub(/".*/, "", v)
+                    if (pkg != "" && v ~ /^[0-9]/) print "npm:" pkg "\t" v
+                    in_block = 0; pkg = ""; next
+                }
+                in_block && /^[[:space:]]*\}/ { in_block = 0; pkg = "" }
+            ' "$src" 2>/dev/null || true
+            # NB: plain `[[ ... ]] && rm` would end the function with status 1
+            # for package-lock.json, and set -eo pipefail would kill the caller.
+            if [[ "$base" == "pnpm-lock.yaml" ]]; then
+                rm -f "$TEMP_DIR/skim_pnpm.$$"
+            fi
+            ;;
+        yarn.lock)
+            # yarn v1: "name@range[, name@range]:" header + indented version line.
+            awk '
+                /^[^#[:space:]].*:[[:space:]]*$/ {
+                    key = $0; sub(/:[[:space:]]*$/, "", key)
+                    split(key, ks, ","); k = ks[1]
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", k); gsub(/^"|"$/, "", k)
+                    name = ""
+                    if (match(k, /@[^@]*$/) > 1) name = substr(k, 1, RSTART - 1)
+                    next
+                }
+                /^[[:space:]]+version[[:space:]]/ {
+                    v = $0; sub(/^[[:space:]]+version[[:space:]]*"?/, "", v); sub(/".*$/, "", v)
+                    if (name != "" && v ~ /^[0-9]/) print "npm:" name "\t" v
+                    name = ""
+                }
+            ' "$lf" 2>/dev/null || true
+            ;;
+        poetry.lock|uv.lock|Cargo.lock)
+            # TOML [[package]] blocks: name = "..." / version = "...".
+            local eco="pypi"
+            [[ "$base" == "Cargo.lock" ]] && eco="crates"
+            awk -v eco="$eco" '
+                /^\[\[package\]\]/ { name = ""; next }
+                /^name[[:space:]]*=/ {
+                    v = $0; sub(/^name[[:space:]]*=[[:space:]]*"/, "", v); sub(/".*/, "", v)
+                    name = v
+                    if (eco == "pypi") { name = tolower(name); gsub(/[_.]/, "-", name) }
+                    next
+                }
+                /^version[[:space:]]*=/ {
+                    if (name == "") next
+                    v = $0; sub(/^version[[:space:]]*=[[:space:]]*"/, "", v); sub(/".*/, "", v)
+                    print eco ":" name "\t" v; name = ""
+                }
+            ' "$lf" 2>/dev/null || true
+            ;;
+        Pipfile.lock)
+            # JSON: 8-space package keys under "default"/"develop", "version": "==x".
+            awk '
+                /^[[:space:]]{8}"[^"]+":[[:space:]]*\{/ {
+                    key = $0; sub(/^[[:space:]]*"/, "", key); sub(/".*/, "", key)
+                    name = tolower(key); gsub(/[_.]/, "-", name); next
+                }
+                /"version":/ {
+                    if (name == "") next
+                    v = $0; sub(/.*"version"[[:space:]]*:[[:space:]]*"=*/, "", v); sub(/".*/, "", v)
+                    if (v ~ /^[0-9]/) print "pypi:" name "\t" v
+                    name = ""
+                }
+            ' "$lf" 2>/dev/null || true
+            ;;
+        composer.lock)
+            # "name": "vendor/pkg" followed by its "version". Requiring "/" in the
+            # name skips the root project block and platform entries like "php".
+            awk '
+                /"name":[[:space:]]*"[^"]+\/[^"]+"/ {
+                    split($0, a, "\""); pkg = a[4]; next
+                }
+                /"version":/ {
+                    if (pkg == "") next
+                    v = $0; sub(/.*"version"[[:space:]]*:[[:space:]]*"v?/, "", v); sub(/".*/, "", v)
+                    print "composer:" pkg "\t" v; pkg = ""
+                }
+            ' "$lf" 2>/dev/null || true
+            ;;
+        go.sum)
+            # "module version[/go.mod] hash" — dedupe the /go.mod double entries.
+            awk '
+                NF >= 3 {
+                    m = $1; v = $2; sub(/\/go\.mod$/, "", v)
+                    k = m "\t" v
+                    if (!(k in seen)) { seen[k] = 1; print "go:" m "\t" v }
+                }
+            ' "$lf" 2>/dev/null || true
+            ;;
+        mix.lock)
+            # "name": {:hex, :name, "1.2.3", ... — quoted fields: 2=key, 4=version.
+            awk '
+                /^[[:space:]]*"[^"]+":[[:space:]]*\{:hex/ {
+                    split($0, a, "\"")
+                    if (a[2] != "" && a[4] ~ /^[0-9]/) print "hex:" a[2] "\t" a[4]
+                }
+            ' "$lf" 2>/dev/null || true
+            ;;
+        Gemfile.lock)
+            # specs section: exactly-4-space-indented "name (1.2.3)" lines.
+            awk '
+                /^    [A-Za-z0-9_.-]+ \([0-9]/ {
+                    v = $2; gsub(/[()]/, "", v)
+                    print "gem:" $1 "\t" v
+                }
+            ' "$lf" 2>/dev/null || true
+            ;;
+    esac
+}
+
+# Function: _skim_extract_manifest
+# Purpose: Extract declared dependency names from one manifest (lockfile-less
+#          fallback). Version column carries the declared spec, or "unpinned".
+# Args: $1 = manifest path
+# Returns: Echoes "eco:name<TAB>spec" lines
+_skim_extract_manifest() {
+    local mf="$1"
+    local base
+    base=$(basename "$mf")
+
+    case "$base" in
+        package.json)
+            # Same explode-then-scan approach as check_packages (inline JSON safe).
+            awk '
+                { buf = buf $0 "\n" }
+                END {
+                    gsub(/[{}]/, "\n&\n", buf); gsub(/,/, "\n", buf)
+                    n = split(buf, lines, "\n"); flag = 0
+                    for (i = 1; i <= n; i++) {
+                        line = lines[i]
+                        if (line ~ /"(dependencies|devDependencies|optionalDependencies)"[[:space:]]*:/) { flag = 1; continue }
+                        if (line ~ /^[[:space:]]*\}/) { flag = 0; continue }
+                        if (flag && line ~ /^[[:space:]]*"[^"]+"[[:space:]]*:/) {
+                            name = line; sub(/^[[:space:]]*"/, "", name); sub(/".*$/, "", name)
+                            ver = line; sub(/^[[:space:]]*"[^"]+"[[:space:]]*:[[:space:]]*"/, "", ver); sub(/".*$/, "", ver)
+                            if (name != "" && ver != "") print "npm:" name "\t" ver
+                        }
+                    }
+                }
+            ' "$mf" 2>/dev/null || true
+            ;;
+        Pipfile)
+            awk '
+                /^\[(packages|dev-packages)\]/ { ind = 1; next }
+                /^\[/ { ind = 0; next }
+                ind && /^[A-Za-z0-9._-]+[[:space:]]*=/ {
+                    n = $1
+                    v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); gsub(/["{}[:space:]]/, "", v)
+                    if (v ~ /^==/) v = substr(v, 3); else v = "unpinned"
+                    n = tolower(n); gsub(/[_.]/, "-", n)
+                    print "pypi:" n "\t" v
+                }
+            ' "$mf" 2>/dev/null || true
+            ;;
+        composer.json)
+            awk '
+                /"(require|require-dev)"[[:space:]]*:/ { ind = 1; next }
+                ind && /\}/ { ind = 0; next }
+                ind && /"[^"]+\/[^"]+"[[:space:]]*:/ {
+                    split($0, a, "\"")
+                    v = (a[4] != "" ? a[4] : "unpinned")
+                    print "composer:" a[2] "\t" v
+                }
+            ' "$mf" 2>/dev/null || true
+            ;;
+        Cargo.toml)
+            awk '
+                /^\[.*dependencies[^]]*\]/ { ind = 1; next }
+                /^\[/ { ind = 0; next }
+                ind && /^[A-Za-z0-9_-]+[[:space:]]*=/ {
+                    n = $1; sub(/=.*/, "", n); gsub(/[[:space:]]/, "", n)
+                    v = "unpinned"
+                    if ($0 ~ /=[[:space:]]*"[^"]+"/) { v = $0; sub(/^[^"]*"/, "", v); sub(/".*/, "", v) }
+                    print "crates:" n "\t" v
+                }
+            ' "$mf" 2>/dev/null || true
+            ;;
+        go.mod)
+            awk '
+                /^require[[:space:]]*\(/ { blk = 1; next }
+                blk && /^\)/ { blk = 0; next }
+                blk && NF >= 2 && $1 ~ /\./ { print "go:" $1 "\t" $2; next }
+                /^require[[:space:]]+[^ (]/ { print "go:" $2 "\t" $3 }
+            ' "$mf" 2>/dev/null || true
+            ;;
+        Gemfile)
+            # gem "name"[, "spec"] — single quotes normalized to double first.
+            awk '
+                /^[[:space:]]*gem[[:space:]]/ {
+                    gsub(sprintf("%c", 39), "\"")
+                    split($0, a, "\"")
+                    if (a[2] != "") print "gem:" a[2] "\t" (a[4] != "" ? a[4] : "unpinned")
+                }
+            ' "$mf" 2>/dev/null || true
+            ;;
+        mix.exs)
+            awk '
+                /\{:[a-z0-9_]+/ {
+                    s = $0
+                    while (match(s, /\{:[a-z0-9_]+/)) {
+                        print "hex:" substr(s, RSTART + 2, RLENGTH - 2) "\tunpinned"
+                        s = substr(s, RSTART + RLENGTH)
+                    }
+                }
+            ' "$mf" 2>/dev/null || true
+            ;;
+        pyproject.toml)
+            # [project] dependencies arrays ("name>=1.0") and [tool.poetry.*dependencies] keys.
+            awk '
+                /^\[tool\.poetry\..*dependencies\]/ { tp = 1; pr = 0; arr = 0; next }
+                /^\[project\]/ { pr = 1; tp = 0; next }
+                /^\[/ { tp = 0; pr = 0; arr = 0; next }
+                tp && /^[A-Za-z0-9._-]+[[:space:]]*=/ {
+                    n = $1; sub(/=.*/, "", n); gsub(/[[:space:]]/, "", n)
+                    if (tolower(n) == "python") next
+                    n = tolower(n); gsub(/[_.]/, "-", n)
+                    print "pypi:" n "\tunpinned"; next
+                }
+                pr && /dependencies[[:space:]]*=/ { arr = 1 }
+                arr {
+                    s = $0
+                    while (match(s, /"[A-Za-z0-9][A-Za-z0-9._-]*/)) {
+                        n = substr(s, RSTART + 1, RLENGTH - 1)
+                        n = tolower(n); gsub(/[_.]/, "-", n)
+                        print "pypi:" n "\tunpinned"
+                        s = substr(s, RSTART + RLENGTH)
+                    }
+                    if (s ~ /\]/ || $0 ~ /\]/) arr = 0
+                }
+            ' "$mf" 2>/dev/null || true
+            ;;
+        *)
+            # requirements*.txt: one requirement per line, exact pins keep the version.
+            awk '
+                /^[[:space:]]*[A-Za-z0-9]/ {
+                    line = $0
+                    sub(/#.*/, "", line); sub(/;.*/, "", line); gsub(/[[:space:]]/, "", line)
+                    if (line == "") next
+                    n = line; sub(/[<>=!~[].*$/, "", n)
+                    spec = substr(line, length(n) + 1)
+                    v = (spec ~ /^==/ ? substr(spec, 3) : "unpinned")
+                    sub(/\[.*/, "", n)
+                    n = tolower(n); gsub(/[_.]/, "-", n)
+                    if (n != "") print "pypi:" n "\t" v
+                }
+            ' "$mf" 2>/dev/null || true
+            ;;
+    esac
+}
+
+# Function: check_skim_lockfiles
+# Purpose: Name-level skim of every lockfile (manifest fallback when none exist)
+#          against the set of package names that ever had a compromised version
+# Args: $1 = scan_dir
+# Modifies: $TEMP_DIR/skim_findings.txt ("file:message" per hit, informational),
+#           SKIM_SOURCES (how many lockfiles/manifests were skimmed)
+# Returns: 0; hit count is the line count of skim_findings.txt
+SKIM_SOURCES=0
+check_skim_lockfiles() {
+    local scan_dir=$1
+
+    # ---- 1) Name index from the compromised list: "eco:name<TAB>full-version-
+    # list<TAB>display-list" (display capped at 6 so keyv-scale entries with
+    # hundreds of versions stay readable).
+    awk -F: '
+        /^[[:space:]]*#/ || NF < 2 { next }
+        {
+            eco = ""; name = ""; ver = ""
+            if ($1 == "npm" && NF >= 3)      { eco = "npm"; name = $2; ver = $3 }
+            else if ($1 == "pypi" && NF >= 3) {
+                eco = "pypi"; name = tolower($2); gsub(/[_.]/, "-", name); ver = $3
+            }
+            else if ($1 ~ /^(composer|crates|go|hex|gem)$/ && NF >= 3) { eco = $1; name = $2; ver = $3 }
+            else if ($0 ~ /^[@a-zA-Z0-9]/ && NF >= 2) { eco = "npm"; name = $1; ver = $2 }
+            if (eco == "" || name == "" || ver == "") next
+            key = eco ":" name
+            cnt[key]++
+            full[key] = (full[key] == "" ? ver : full[key] " " ver)
+            if (cnt[key] <= 6) disp[key] = (disp[key] == "" ? ver : disp[key] " " ver)
+        }
+        END {
+            for (k in full) {
+                extra = (cnt[k] > 6 ? " (+" cnt[k] - 6 " more)" : "")
+                print k "\t" full[k] "\t" disp[k] extra
+            }
+        }
+    ' "$COMPROMISED_PACKAGES_FILE" > "$TEMP_DIR/skim_name_index.txt" 2>/dev/null || true
+
+    # ---- 2) Find lockfiles. The skim runs BEFORE collect_all_files, so it does
+    # its own (much cheaper) find and its own detector self-exclusion (issue
+    # #146: the detector's test fixtures contain deliberately infected lockfiles).
+    local self_real scan_real
+    self_real=$(cd "$SCRIPT_DIR" 2>/dev/null && pwd -P || true)
+    scan_real=$(cd "$scan_dir" 2>/dev/null && pwd -P || true)
+
+    find "$scan_dir" -type f \( \
+        -name "package-lock.json" -o -name "yarn.lock" -o -name "pnpm-lock.yaml" -o \
+        -name "poetry.lock" -o -name "uv.lock" -o -name "Pipfile.lock" -o \
+        -name "composer.lock" -o -name "Cargo.lock" -o -name "go.sum" -o \
+        -name "mix.lock" -o -name "Gemfile.lock" \
+    \) 2>/dev/null > "$TEMP_DIR/skim_sources_raw.txt" || true
+
+    local skim_kind="lockfile"
+    if [[ ! -s "$TEMP_DIR/skim_sources_raw.txt" ]]; then
+        # Fallback: no lockfiles anywhere — skim declared manifest names instead
+        # (resolution unpinned, so transitive deps are invisible; still catches
+        # a direct dependency on a package with infection history).
+        skim_kind="manifest"
+        find "$scan_dir" -type f \( \
+            -name "package.json" -o -name "requirements*.txt" -o -name "*-requirements.txt" -o \
+            -name "Pipfile" -o -name "pyproject.toml" -o -name "composer.json" -o \
+            -name "Cargo.toml" -o -name "go.mod" -o -name "Gemfile" -o -name "mix.exs" \
+        \) 2>/dev/null | grep -vE "/(node_modules|vendor|\.venv|venv|\.tox|site-packages|target|_build|deps)/" \
+            > "$TEMP_DIR/skim_sources_raw.txt" || true
+    fi
+
+    # Detector self-exclusion (physical-path comparison, symlink-safe).
+    : > "$TEMP_DIR/skim_sources.txt"
+    local src
+    while IFS= read -r src; do
+        [[ -z "$src" ]] && continue
+        if [[ -n "$self_real" && -n "$scan_real" && ( "$self_real" == "$scan_real" || "$self_real" == "$scan_real"/* ) ]]; then
+            local rel="${src#"$scan_dir"}"; rel="${rel#/}"
+            local abs="$scan_real/$rel"
+            [[ "$abs" == "$self_real" || "$abs" == "$self_real"/* ]] && continue
+        fi
+        printf '%s\n' "$src" >> "$TEMP_DIR/skim_sources.txt"
+    done < "$TEMP_DIR/skim_sources_raw.txt"
+
+    SKIM_SOURCES=$(wc -l < "$TEMP_DIR/skim_sources.txt" 2>/dev/null || echo "0")
+    if [[ "$SKIM_SOURCES" -eq 0 ]]; then
+        print_status "$YELLOW" "   ⚠️  Nothing to skim: no lockfiles or manifests found under $scan_dir."
+        print_status "$YELLOW" "      The skim cannot assess this tree — run a full scan (without --skim) for content checks."
+        return 0
+    fi
+    if [[ "$skim_kind" == "manifest" ]]; then
+        print_status "$YELLOW" "   No lockfiles found — falling back to declared manifest names ($SKIM_SOURCES manifests, resolution unpinned, transitive deps invisible)."
+    else
+        print_status "$BLUE" "   Skimming $SKIM_SOURCES lockfile(s) for package names with infection history..."
+    fi
+
+    # ---- 3) Extract "file<TAB>eco:name<TAB>version" tuples from every source.
+    : > "$TEMP_DIR/skim_pairs.txt"
+    while IFS= read -r src; do
+        [[ -f "$src" && -r "$src" ]] || continue
+        if [[ "$skim_kind" == "lockfile" ]]; then
+            _skim_extract_lockfile "$src"
+        else
+            _skim_extract_manifest "$src"
+        fi | awk -v f="$src" '{ print f "\t" $0 }' >> "$TEMP_DIR/skim_pairs.txt"
+    done < "$TEMP_DIR/skim_sources.txt"
+
+    # ---- 4) Match names against the index. Exact-version membership upgrades
+    # the message (the deep scan will independently confirm those).
+    awk '
+        BEGIN { FS = "\t" }
+        NR == FNR { full[$1] = $2; disp[$1] = $3; next }
+        {
+            file = $1; key = $2; v = $3
+            if (!(key in full)) next
+            dk = file "|" key "|" v
+            if (dk in seen) next
+            seen[dk] = 1
+            i = index(key, ":"); eco = substr(key, 1, i - 1); nm = substr(key, i + 1)
+            if (v != "unpinned" && index(" " full[key] " ", " " v " ") > 0)
+                print file ":COMPROMISED VERSION IN LOCK: " nm "@" v " [" eco "] — this exact version is in the compromised list (deep scan will confirm)"
+            else
+                print file ":Package with infection history: " nm "@" v " [" eco "] (this version is not in the compromised list; compromised versions: " disp[key] ")"
+        }
+    ' "$TEMP_DIR/skim_name_index.txt" "$TEMP_DIR/skim_pairs.txt" > "$TEMP_DIR/skim_findings.txt" 2>/dev/null || true
+
+    # ---- Console summary (capped; the full list lands in the report / logs).
+    local pair_count hit_count
+    pair_count=$(wc -l < "$TEMP_DIR/skim_pairs.txt" 2>/dev/null || echo "0")
+    hit_count=$(wc -l < "$TEMP_DIR/skim_findings.txt" 2>/dev/null || echo "0")
+    if [[ "$hit_count" -gt 0 ]]; then
+        print_status "$YELLOW" "   ⚠️  Skim: $hit_count of $pair_count packages have infection history:"
+        local shown=0 line
+        while IFS= read -r line && [[ $shown -lt 15 ]]; do
+            print_status "$YELLOW" "      - ${line#*:}"
+            shown=$((shown + 1))
+        done < "$TEMP_DIR/skim_findings.txt"
+        if [[ "$hit_count" -gt 15 ]]; then
+            print_status "$YELLOW" "      ... and $((hit_count - 15)) more (full list in the report)"
+        fi
+    else
+        print_status "$GREEN" "   ✅ Skim clean: none of the $pair_count packages across $SKIM_SOURCES ${skim_kind}(s) has infection history."
+    fi
+    # Explicit success: a trailing conditional above must never leak a non-zero
+    # status out of the function (set -e would abort the whole scan).
+    return 0
+}
+
 # Function: check_typosquatting
 # Purpose: Detect typosquatting and homoglyph attacks in package dependencies
 # Args: $1 = scan_dir (directory to scan)
@@ -5101,6 +5570,9 @@ write_log_file() {
 
         # Namespace warnings (has full paths in format: /path/to/file:namespace_info)
         [[ -s "$TEMP_DIR/namespace_warnings.txt" ]] && cut -d: -f1 "$TEMP_DIR/namespace_warnings.txt" || true
+
+        # Skim name-hits (--skim, informational: lockfile path before colon)
+        [[ -s "$TEMP_DIR/skim_findings.txt" ]] && cut -d: -f1 "$TEMP_DIR/skim_findings.txt" || true
     } | sort -u >> "$log_file"
 
     print_status "$GREEN" "Log saved to: $log_file"
@@ -5259,6 +5731,9 @@ write_json_file() {
         [[ -s "$TEMP_DIR/crypto_patterns.txt" ]] && \
             grep "LOW RISK" "$TEMP_DIR/crypto_patterns.txt" 2>/dev/null | _jf_pathmsg_stdin LOW || true
         _jf_pathmsg LOW "$TEMP_DIR/namespace_warnings.txt"
+        # Skim name-hits (--skim): informational — package names with infection
+        # history; the deep scan reports any actually-compromised versions above.
+        _jf_pathmsg LOW "$TEMP_DIR/skim_findings.txt"
     } > "$tsv"
 
     jq -R -n \
@@ -6115,6 +6590,28 @@ generate_report() {
         echo
     fi
 
+    # ---- Skim name-hits (--skim, informational). These packages carried a
+    # compromised version at SOME point; the locked/declared version here was
+    # not itself in the list (versions that ARE in the list get flagged by the
+    # deep-scan sections above). Never counted toward the risk totals.
+    if [[ -s "$TEMP_DIR/skim_findings.txt" ]]; then
+        print_status "$BLUE" "ℹ️  SKIM (informational): dependencies whose package name has infection history:"
+        local skim_shown=0
+        local skim_total
+        skim_total=$(wc -l < "$TEMP_DIR/skim_findings.txt")
+        while IFS= read -r entry && [[ $skim_shown -lt 15 ]]; do
+            echo "   - ${entry#*:}"
+            echo "     Found in: ${entry%%:*}"
+            skim_shown=$((skim_shown+1))
+        done < "$TEMP_DIR/skim_findings.txt"
+        if [[ $skim_total -gt 15 ]]; then
+            echo "   - ... and $((skim_total - 15)) more skim hits (see --save-log / --json for the full list)"
+        fi
+        echo -e "   ${BLUE}NOTE: A safe locked version of a once-compromised package is not an active threat,${NC}"
+        echo -e "   ${BLUE}but keep it pinned and watch that dependency — its publish chain has been breached before.${NC}"
+        echo
+    fi
+
     total_issues=$((high_risk + medium_risk))
     local low_risk_count=0
     if [[ -s "$TEMP_DIR/low_risk_findings.txt" ]]; then
@@ -6586,6 +7083,9 @@ run_bulk_scan() {
     local child_flags=()
     [[ "$paranoid_mode" == "true" ]] && child_flags+=("--paranoid")
     [[ "$CHECK_SEMVER_RANGES" == "true" ]] && child_flags+=("--check-semver-ranges")
+    # --skim propagates: per-project skim-clean fast exits make bulk runs over
+    # mostly-clean project farms dramatically cheaper.
+    [[ "$SKIM_MODE" == "true" ]] && child_flags+=("--skim")
     [[ -n "$ECOSYSTEM_OVERRIDE" ]] && child_flags+=("--ecosystem" "$ECOSYSTEM_OVERRIDE")
     child_flags+=("--parallelism" "$PARALLELISM")
     case "$GREP_TOOL" in
@@ -6889,6 +7389,9 @@ main() {
             --check-semver-ranges)
                 CHECK_SEMVER_RANGES=true
                 ;;
+            --skim)
+                SKIM_MODE=true
+                ;;
             --help|-h)
                 usage
                 ;;
@@ -7031,6 +7534,26 @@ main() {
         print_status "$BLUE" "Scanning directory: $scan_dir"
     fi
     echo
+
+    # --skim: name-level lockfile pre-filter BEFORE any expensive stage. Clean
+    # skim -> exit 0 right here (fast CI path; the deep scan and its content
+    # checks are intentionally skipped — documented in usage/README). Any hit ->
+    # print the potential threats and fall through to the full deep scan, whose
+    # verdict alone decides the exit code (skim findings stay informational).
+    if [[ "$SKIM_MODE" == "true" ]]; then
+        print_status "$ORANGE" "[Skim] Fast lockfile threat skim (package names with infection history)"
+        check_skim_lockfiles "$scan_dir"
+        if [[ ! -s "$TEMP_DIR/skim_findings.txt" ]]; then
+            print_stage_complete "Skim (clean — deep scan skipped)"
+            # Honor the log/JSON contracts on the fast path too (empty findings).
+            [[ -n "$save_log" ]] && write_log_file "$save_log"
+            [[ -n "$json_out" ]] && write_json_file "$json_out" "$scan_dir"
+            exit 0
+        fi
+        print_status "$YELLOW" "   Potential threats found — escalating to the full deep scan."
+        print_stage_complete "Skim (escalating)"
+        echo
+    fi
 
     # Collect all files in a single pass for performance optimization
     print_status "$ORANGE" "[Stage 1/6] Collecting file inventory for analysis"

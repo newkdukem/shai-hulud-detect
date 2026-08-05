@@ -5,6 +5,23 @@ All notable changes to the Shai-Hulud NPM Supply Chain Attack Detector will be d
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.16.0] - 2026-08-05
+
+> Numbered 3.16.0 on the assumption that the `--history` historical-forensics branch (3.15.0) merges first; renumber if this lands earlier.
+
+### Added
+- **Fast skim mode (`--skim`)**: a name-level lockfile pre-filter that runs BEFORE any expensive stage. It answers one question: does any dependency or sub-dependency in the resolved tree carry a NAME that ever had a compromised version — any version? A project depending on such a package (even at a safe version) sits in that package's blast radius and earns the full deep scan; a tree whose dependency set never touched a compromised package name exits 0 immediately (fast CI path — the deep scan, including content-pattern checks, is intentionally skipped and the usage text says so).
+  - **Escalation contract**: any name hit prints the potential threats and automatically continues into the full deep scan, whose verdict alone decides the exit code. A name hit at a safe locked version is informational only (report section, `--save-log` LOW tier, `--json` LOW findings); a locked version that is itself in the compromised list is pre-flagged by the skim (`COMPROMISED VERSION IN LOCK`) and taken to HIGH/MEDIUM by the deep scan as usual.
+  - **Coverage**: dedicated extractors for `package-lock.json` (v1/v2/v3, scoped names, compact one-line entries), `yarn.lock`, `pnpm-lock.yaml` (via `transform_pnpm_yaml`), `poetry.lock`, `uv.lock`, `Pipfile.lock`, `composer.lock`, `Cargo.lock`, `go.sum` (with `/go.mod` dedupe), `mix.lock`, and `Gemfile.lock`. PyPI names are PEP-503-normalized to match `pypi:` list entries.
+  - **Manifest fallback**: with zero lockfiles in the tree, declared dependency names are skimmed instead (`package.json`, `requirements*.txt`, `Pipfile`, `pyproject.toml` — both `[project]` arrays and `[tool.poetry.*dependencies]` tables — `composer.json`, `Cargo.toml`, `go.mod`, `Gemfile`, `mix.exs`), flagged as unpinned/transitive-invisible. A tree with neither lockfiles nor manifests prints an explicit "nothing to skim — run a full scan" warning.
+  - **Reporting**: compromised-version lists in skim messages are capped at 6 shown (keyv-scale entries have hundreds); skim findings honor the `--save-log`/`--json` contracts on both the fast-clean and escalated paths; the skim does its own detector self-exclusion (issue #146) since it runs before `collect_all_files`.
+  - **`--bulk` propagates `--skim`** — per-project fast exits make bulk runs over mostly-clean project farms dramatically cheaper.
+- **Test coverage**: `run-tests.sh` gains a `--skim` block: clean fast-exit (and proof the deep scan did NOT run), safe-version name hit (escalation + informational + exit 0), no-flag control, compromised locked version (exit 1), manifest fallback, and one assertion per lockfile extractor via a `SHAI_HULUD_PACKAGES_FILE` override with one name per ecosystem. Suite: 238 → 255 checks.
+
+### Changed
+- **`shai-hulud-detector.sh`**: `SCRIPT_VERSION` 3.14.1 → 3.16.0.
+- **`README.md`**: new "Fast skim mode (`--skim`)" scenario section, flags-table row, "How it works" step 6; tests badge/count 238 → 255.
+
 ## [3.14.1] - 2026-08-04
 
 ### Added

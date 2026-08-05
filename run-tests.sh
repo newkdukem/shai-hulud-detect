@@ -1050,6 +1050,194 @@ else
 fi
 
 # ============================================================
+#  Testing --skim mode (fast lockfile name-level pre-filter)
+# ============================================================
+# --skim answers "does ANY dependency name in the lockfile carry infection
+# history?" before doing anything expensive. Clean skim -> exit 0 immediately
+# (deep scan skipped). Any name hit -> escalate to the full deep scan, whose
+# verdict alone decides the exit code; skim hits stay informational.
+echo ""
+echo "========================================"
+echo "  Testing --skim mode"
+echo "========================================"
+
+SKIM_TMP=$(mktemp -d)
+
+# Fixture 1: lockfile with only never-compromised names -> fast clean exit.
+mkdir -p "$SKIM_TMP/clean"
+cat > "$SKIM_TMP/clean/package-lock.json" <<'EOF'
+{
+  "name": "clean-app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "clean-app", "version": "1.0.0" },
+    "node_modules/express": { "version": "4.18.2" }
+  }
+}
+EOF
+
+SKIM_CLEAN_OUT=$("$BASH_CMD" "$DETECTOR" --skim "$SKIM_TMP/clean" 2>&1)
+SKIM_CLEAN_EXIT=$?
+((total++))
+if [[ $SKIM_CLEAN_EXIT -eq 0 ]] && grep -qF "Skim clean" <<< "$SKIM_CLEAN_OUT"; then
+    echo -e "${GREEN}PASS${NC}: --skim clean lockfile exits 0 with skim-clean verdict"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: --skim clean lockfile (exit $SKIM_CLEAN_EXIT)"
+    ((failed++))
+fi
+((total++))
+if ! grep -qF "[Stage 1/6]" <<< "$SKIM_CLEAN_OUT"; then
+    echo -e "${GREEN}PASS${NC}: --skim clean path SKIPS the deep scan (no Stage 1 ran)"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: --skim clean path still ran the deep scan"
+    ((failed++))
+fi
+
+# Fixture 2: keyv@5.2.0 — the NAME has infection history (keyv@6.0.0, Aug 2026
+# wave) but this version is safe -> must escalate, deep scan clean, exit 0,
+# hit reported as informational only.
+mkdir -p "$SKIM_TMP/safe-hit"
+cat > "$SKIM_TMP/safe-hit/package-lock.json" <<'EOF'
+{
+  "name": "keyv-app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "keyv-app", "version": "1.0.0" },
+    "node_modules/keyv": { "version": "5.2.0" },
+    "node_modules/express": { "version": "4.18.2" }
+  }
+}
+EOF
+
+SKIM_SAFE_OUT=$("$BASH_CMD" "$DETECTOR" --skim "$SKIM_TMP/safe-hit" 2>&1)
+SKIM_SAFE_EXIT=$?
+for skim_check in \
+    "name hit at safe version reported|Package with infection history: keyv@5.2.0" \
+    "escalates to the deep scan|escalating to the full deep scan" \
+    "deep scan verdict stays clean|No indicators of Shai-Hulud compromise detected"
+do
+    label="${skim_check%|*}"
+    pattern="${skim_check#*|}"
+    ((total++))
+    if grep -qF "$pattern" <<< "$SKIM_SAFE_OUT"; then
+        echo -e "${GREEN}PASS${NC}: --skim safe-version hit: $label"
+        ((passed++))
+    else
+        echo -e "${RED}FAIL${NC}: --skim safe-version hit missing: $label (looked for '$pattern')"
+        ((failed++))
+    fi
+done
+((total++))
+if [[ $SKIM_SAFE_EXIT -eq 0 ]]; then
+    echo -e "${GREEN}PASS${NC}: --skim safe-version hit exits 0 (informational only, deep scan clean)"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: --skim safe-version hit exit $SKIM_SAFE_EXIT (expected 0)"
+    ((failed++))
+fi
+
+# Control: without --skim the same tree must not mention the skim at all.
+SKIM_OFF_OUT=$("$BASH_CMD" "$DETECTOR" "$SKIM_TMP/safe-hit" 2>&1)
+((total++))
+if ! grep -qF "Skim" <<< "$SKIM_OFF_OUT"; then
+    echo -e "${GREEN}PASS${NC}: skim does not run without --skim"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: skim output appeared without the --skim flag"
+    ((failed++))
+fi
+
+# Fixture 3: an actually-compromised locked version -> skim pre-flags it and
+# the deep scan takes it to HIGH (exit 1).
+mkdir -p "$SKIM_TMP/bad-hit"
+printf '{\n  "name": "bad-app",\n  "dependencies": {\n    "@ctrl/tinycolor": "4.1.1"\n  }\n}\n' > "$SKIM_TMP/bad-hit/package.json"
+cat > "$SKIM_TMP/bad-hit/package-lock.json" <<'EOF'
+{
+  "name": "bad-app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "bad-app", "version": "1.0.0" },
+    "node_modules/@ctrl/tinycolor": { "version": "4.1.1" }
+  }
+}
+EOF
+
+SKIM_BAD_OUT=$("$BASH_CMD" "$DETECTOR" --skim "$SKIM_TMP/bad-hit" 2>&1)
+SKIM_BAD_EXIT=$?
+((total++))
+if [[ $SKIM_BAD_EXIT -eq 1 ]] && grep -qF "COMPROMISED VERSION IN LOCK: @ctrl/tinycolor@4.1.1" <<< "$SKIM_BAD_OUT"; then
+    echo -e "${GREEN}PASS${NC}: --skim pre-flags a compromised locked version and deep scan exits 1"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: --skim compromised-version case (exit $SKIM_BAD_EXIT)"
+    ((failed++))
+fi
+
+# Fixture 4: no lockfile at all -> falls back to declared manifest names.
+mkdir -p "$SKIM_TMP/fallback"
+printf '{\n  "name": "fb-app",\n  "dependencies": {\n    "keyv": "^5.0.0"\n  }\n}\n' > "$SKIM_TMP/fallback/package.json"
+SKIM_FB_OUT=$("$BASH_CMD" "$DETECTOR" --skim "$SKIM_TMP/fallback" 2>&1)
+((total++))
+if grep -qF "No lockfiles found" <<< "$SKIM_FB_OUT" && grep -qF "Package with infection history: keyv@^5.0.0" <<< "$SKIM_FB_OUT"; then
+    echo -e "${GREEN}PASS${NC}: --skim manifest fallback fires on declared dependency names"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: --skim manifest fallback did not fire"
+    ((failed++))
+fi
+
+# All eight lockfile extractors, driven by a SHAI_HULUD_PACKAGES_FILE override
+# with one name per ecosystem. Every fixture pins a DIFFERENT (safe) version, so
+# each hit proves name-level matching plus that parser's extraction.
+SKIM_ECO_DIR="$SKIM_TMP/eco"
+mkdir -p "$SKIM_ECO_DIR"
+SKIM_PKGS="$SKIM_TMP/skim-pkgs.txt"
+cat > "$SKIM_PKGS" <<'EOF'
+npm:skimpkg:1.0.0
+pypi:skim_py:2.0.0
+composer:acme/skimlib:1.2.3
+crates:skimcrate:0.1.0
+go:example.com/skim/mod:v1.0.0
+hex:skimhex:0.5.0
+gem:skimgem:3.0.0
+EOF
+printf 'skimpkg@^1.0.0:\n  version "1.0.5"\n' > "$SKIM_ECO_DIR/yarn.lock"
+printf '[[package]]\nname = "Skim_Py"\nversion = "2.1.0"\n' > "$SKIM_ECO_DIR/poetry.lock"
+printf '{\n    "default": {\n        "skim-py": {\n            "version": "==2.2.0"\n        }\n    }\n}\n' > "$SKIM_ECO_DIR/Pipfile.lock"
+printf '{\n  "packages": [\n    {\n      "name": "acme/skimlib",\n      "version": "v1.3.0"\n    }\n  ]\n}\n' > "$SKIM_ECO_DIR/composer.lock"
+printf '[[package]]\nname = "skimcrate"\nversion = "0.2.0"\n' > "$SKIM_ECO_DIR/Cargo.lock"
+printf 'example.com/skim/mod v1.1.0 h1:abc=\nexample.com/skim/mod v1.1.0/go.mod h1:def=\n' > "$SKIM_ECO_DIR/go.sum"
+printf '%%{\n  "skimhex": {:hex, :skimhex, "0.6.0", "deadbeef", [:mix], [], "hexpm"},\n}\n' > "$SKIM_ECO_DIR/mix.lock"
+printf 'GEM\n  remote: https://rubygems.org/\n  specs:\n    skimgem (3.1.0)\n\nDEPENDENCIES\n  skimgem\n' > "$SKIM_ECO_DIR/Gemfile.lock"
+
+SKIM_ECO_OUT=$(SHAI_HULUD_PACKAGES_FILE="$SKIM_PKGS" "$BASH_CMD" "$DETECTOR" --skim "$SKIM_ECO_DIR" 2>&1)
+for eco_check in \
+    "yarn.lock (npm)|skimpkg@1.0.5 [npm]" \
+    "poetry.lock (pypi, normalized name)|skim-py@2.1.0 [pypi]" \
+    "Pipfile.lock (pypi)|skim-py@2.2.0 [pypi]" \
+    "composer.lock (v-prefix stripped)|acme/skimlib@1.3.0 [composer]" \
+    "Cargo.lock (crates)|skimcrate@0.2.0 [crates]" \
+    "go.sum (go, /go.mod deduped)|example.com/skim/mod@v1.1.0 [go]" \
+    "mix.lock (hex)|skimhex@0.6.0 [hex]" \
+    "Gemfile.lock (gem)|skimgem@3.1.0 [gem]"
+do
+    label="${eco_check%|*}"
+    pattern="${eco_check#*|}"
+    ((total++))
+    if grep -qF "Package with infection history: $pattern" <<< "$SKIM_ECO_OUT"; then
+        echo -e "${GREEN}PASS${NC}: --skim extracts $label"
+        ((passed++))
+    else
+        echo -e "${RED}FAIL${NC}: --skim did NOT extract $label (looked for '$pattern')"
+        ((failed++))
+    fi
+done
+
+rm -rf "$SKIM_TMP"
+
+# ============================================================
 #  Testing --bulk mode (project discovery + aggregate report)
 # ============================================================
 echo ""

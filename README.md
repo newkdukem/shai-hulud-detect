@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Shell](https://img.shields.io/badge/shell-Bash%205.0%2B-blue)](#requirements)
 [![Status](https://img.shields.io/badge/status-Active-success)](../../)
-[![Tests](https://img.shields.io/badge/tests-238%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-255%20passing-brightgreen)](#testing)
 [![Packages](https://img.shields.io/badge/compromised%20packages-3%2C460%2B-red)](compromised-packages.txt)
 [![Type](https://img.shields.io/badge/type-Security%20Tool-red)](#what-it-catches)
 [![Contributions](https://img.shields.io/badge/contributions-Welcome-orange)](#contributing)
@@ -127,6 +127,20 @@ shai-hulud-bulk-report-<timestamp>/
     └── <project>.console.txt     # full scan output, ANSI-stripped
 ```
 
+### Fast skim mode (`--skim`)
+
+A cheap pre-filter for CI and bulk runs. Before doing anything expensive, `--skim` skims every lockfile for dependency or sub-dependency **names** that ever had a compromised version — *any* version. If `nodemon` was infected at some point and `nodemon` is anywhere in your lockfile (even at a safe version), the project sits in that package's blast radius and earns the full deep scan. If the whole resolved dependency tree never touched a compromised package name, the deep scan is skipped entirely:
+
+```bash
+./shai-hulud-detector.sh --skim /path/to/project        # fast path: exit 0 in well under a second when clean
+./shai-hulud-detector.sh --bulk --skim ~/dev            # bulk runs: per-project fast exits
+```
+
+- **Clean skim** → exit `0` immediately; the deep scan (including content-pattern checks) is skipped. Run a full scan periodically for complete coverage.
+- **Any name hit** → the potential threats are printed and the full deep scan runs automatically. The deep scan's verdict alone decides the exit code: a name hit at a **safe** locked version is reported as informational only (report section, `--save-log` LOW, `--json` LOW), while an actually-compromised locked version is pre-flagged by the skim and taken to HIGH by the deep scan as usual.
+- Covers all supported lockfiles: `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `poetry.lock`, `uv.lock`, `Pipfile.lock`, `composer.lock`, `Cargo.lock`, `go.sum`, `mix.lock`, `Gemfile.lock`.
+- **No lockfiles at all** → falls back to declared manifest dependency names (`package.json`, `requirements*.txt`, `Pipfile`, `pyproject.toml`, `composer.json`, `Cargo.toml`, `go.mod`, `Gemfile`, `mix.exs`), with a note that resolution is unpinned and transitive deps are invisible.
+
 ### Paranoid mode (`--paranoid`)
 
 Adds typosquatting detection and network-exfiltration heuristics on top of the core checks. These are general-purpose security signals, not Shai-Hulud-specific, and produce more false positives — useful for audits, not recommended for CI gating.
@@ -181,6 +195,7 @@ For CI gates and tooling that consume findings as data (rather than parsing cons
 | Flag | Effect |
 |---|---|
 | `--json FILE` | Write findings as structured JSON (severity/file/line/message + summary). Requires `jq`. |
+| `--skim` | Fast pre-filter: skim lockfile names for infection history; clean → exit 0, hits → auto deep scan. |
 | `--check-semver-ranges` | Flag `^`/`~` ranges that could resolve to compromised versions (informational, LOW risk). |
 | `--ecosystem LIST` | Restrict checks to `npm`, `pypi`, `all`, or a comma-separated list. Default: auto-detect. |
 | `--parallelism N` | Threads for parallelisable steps. Defaults to your CPU count. |
@@ -196,7 +211,7 @@ For CI gates and tooling that consume findings as data (rather than parsing cons
 3. **Match** every resolved package version against `compromised-packages.txt` via a sorted set-intersection (`comm -12`).
 4. **Hash** priority files (`bundle.js`, `setup_bun.js`, `router_init.js`, `tanstack_runner.js`, `cat.py`, `node-ipc.cjs`, etc.) and compare against 20 known-malicious SHA-256s.
 5. **Grep** for content-pattern IoCs: C2 domains, threat-actor accounts, dead-man's-switch service names, wipe-threat strings, malicious commit SHAs, beacon strings, payload filenames, orphan-commit `optionalDependencies` patterns.
-6. **(Opt-in)** scan `$HOME` for persistence artifacts (`--check-host`); run typosquatting + network-exfil heuristics (`--paranoid`); flag latent semver-range risk (`--check-semver-ranges`).
+6. **(Opt-in)** pre-filter with a name-level lockfile skim (`--skim`); scan `$HOME` for persistence artifacts (`--check-host`); run typosquatting + network-exfil heuristics (`--paranoid`); flag latent semver-range risk (`--check-semver-ranges`).
 7. **Report** in three severity tiers (HIGH/MEDIUM/LOW), with remediation order for the safety-critical findings.
 
 Detection is read-only. The script never modifies, deletes, or quarantines anything — manual review and remediation are on you.
@@ -253,7 +268,7 @@ To add new packages from a fresh advisory: append entries in that format, run `.
 ## Testing
 
 ```bash
-./run-tests.sh                          # full suite, 238 checks
+./run-tests.sh                          # full suite, 255 checks
 ./shai-hulud-detector.sh test-cases/<fixture-name>   # run one fixture manually
 ```
 
